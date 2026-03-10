@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   applyDemoInstall,
   applyDemoOpenClawInstall,
+  applyDemoOpenClawScanDir,
   applyDemoMirrorMode,
   buildDemoEnvironmentScan,
   buildDemoOpenClawCatalog,
@@ -16,15 +17,26 @@ import type {
   MirrorSwitchResult,
   OpenClawCatalog,
   OpenClawInstallLaunchResult,
+  OpenClawScanPathResult,
   Platform,
 } from "@/lib/types";
 
 const SCAN_TIMEOUT_MS = 8_000;
+const OPENCLAW_SCAN_TIMEOUT_MS = 15_000;
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string) {
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+  timeoutMessage?: string,
+) {
   return new Promise<T>((resolve, reject) => {
     const timer = window.setTimeout(() => {
-      reject(new Error(`${label}超时，请检查 Node.js / npm / Git / Homebrew 命令是否卡住。`));
+      reject(
+        new Error(
+          timeoutMessage ?? `${label}超时，请检查 Node.js / npm / Git / Homebrew 命令是否卡住。`,
+        ),
+      );
     }, timeoutMs);
 
     promise
@@ -81,7 +93,12 @@ export async function fetchOpenClawCatalog() {
     return buildDemoOpenClawCatalog();
   }
 
-  return withTimeout(invoke<OpenClawCatalog>("fetch_openclaw_catalog"), SCAN_TIMEOUT_MS, "OpenClaw 检测");
+  return withTimeout(
+    invoke<OpenClawCatalog>("fetch_openclaw_catalog"),
+    OPENCLAW_SCAN_TIMEOUT_MS,
+    "OpenClaw 检测",
+    "OpenClaw 检测超时，请确认 OpenClaw 安装目录已加入检测路径后再重试。",
+  );
 }
 
 export async function installOpenClaw() {
@@ -90,4 +107,12 @@ export async function installOpenClaw() {
   }
 
   return invoke<OpenClawInstallLaunchResult>("install_openclaw");
+}
+
+export async function registerOpenClawScanDir(path: string) {
+  if (!isTauriRuntime()) {
+    return applyDemoOpenClawScanDir(path) satisfies OpenClawScanPathResult;
+  }
+
+  return invoke<OpenClawScanPathResult>("register_openclaw_scan_dir", { path });
 }

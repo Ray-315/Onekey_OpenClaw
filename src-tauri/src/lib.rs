@@ -2,9 +2,9 @@ mod scanner;
 
 use scanner::{
     fetch_openclaw_catalog_inner, install_dependency_inner, install_openclaw_inner,
-    scan_environment_inner, switch_mirror_mode_inner, DependencyId, EnvironmentScan,
-    InstallLaunchResult, MirrorMode, MirrorSwitchResult, OpenClawCatalog,
-    OpenClawInstallLaunchResult,
+    register_openclaw_scan_dir_inner, scan_environment_inner, switch_mirror_mode_inner,
+    DependencyId, EnvironmentScan, InstallLaunchResult, MirrorMode, MirrorSwitchResult,
+    OpenClawCatalog, OpenClawInstallLaunchResult, OpenClawScanPathResult,
 };
 
 #[tauri::command]
@@ -42,6 +42,13 @@ async fn install_openclaw() -> Result<OpenClawInstallLaunchResult, String> {
         .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+async fn register_openclaw_scan_dir(path: String) -> Result<OpenClawScanPathResult, String> {
+    tauri::async_runtime::spawn_blocking(move || register_openclaw_scan_dir_inner(path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -49,7 +56,8 @@ pub fn run() {
             install_dependency,
             switch_mirror_mode,
             fetch_openclaw_catalog,
-            install_openclaw
+            install_openclaw,
+            register_openclaw_scan_dir
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OpenClaw deployer");

@@ -40,9 +40,8 @@ const HOMEBREW_TUNA_BOTTLE_DOMAIN: &str =
 const HOMEBREW_INSTALL_COMMAND: &str =
     "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
-const OPENCLAW_MODELS_TIMEOUT: Duration = Duration::from_secs(8);
-const OPENCLAW_INSTALL_MACOS_COMMAND: &str =
-    "curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-onboard";
+const OPENCLAW_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
+const OPENCLAW_NPM_REGISTRY_OFFICIAL: &str = "https://registry.npmjs.org";
 const OPENCLAW_NPMRC_BEGIN: &str = "# >>> openclaw-deployer mirror >>>";
 const OPENCLAW_NPMRC_END: &str = "# <<< openclaw-deployer mirror <<<";
 
@@ -159,6 +158,7 @@ pub struct OpenClawCatalog {
     pub version: Option<String>,
     pub message: String,
     pub runtime_status: OpenClawRuntimeStatus,
+    pub scan_paths: Vec<String>,
     pub providers: Vec<OpenClawProviderCatalog>,
 }
 
@@ -170,10 +170,21 @@ pub struct OpenClawInstallLaunchResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawScanPathResult {
+    pub path: String,
+    pub message: String,
+    pub scan_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
+    #[serde(default = "default_mirror_mode")]
     mirror_mode: MirrorMode,
+    #[serde(default)]
+    openclaw_scan_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +209,7 @@ pub fn scan_environment_inner() -> Result<EnvironmentScan, String> {
 }
 
 pub fn fetch_openclaw_catalog_inner() -> Result<OpenClawCatalog, String> {
+    let scan_paths = configured_openclaw_scan_dirs_as_strings();
     let version_probe = probe_openclaw_version();
 
     match version_probe.status {
@@ -221,6 +233,7 @@ pub fn fetch_openclaw_catalog_inner() -> Result<OpenClawCatalog, String> {
                 version: version_probe.version,
                 message,
                 runtime_status: probe_openclaw_runtime_status(),
+                scan_paths,
                 providers,
             })
         }
@@ -229,6 +242,7 @@ pub fn fetch_openclaw_catalog_inner() -> Result<OpenClawCatalog, String> {
             version: None,
             message: "请先安装 OpenClaw，再通过 CLI 拉取可用 provider 和模型列表。".into(),
             runtime_status: OpenClawRuntimeStatus::Stopped,
+            scan_paths,
             providers: Vec::new(),
         }),
     }
@@ -249,18 +263,24 @@ pub fn install_dependency_inner(id: DependencyId) -> Result<InstallLaunchResult,
 
 pub fn install_openclaw_inner() -> Result<OpenClawInstallLaunchResult, String> {
     let platform = current_platform()?;
+    let mirror_mode = load_app_settings().mirror_mode;
+    let default_scan_dir = default_openclaw_bin_dir()?;
+    register_openclaw_scan_dir(default_scan_dir.clone())?;
 
     match platform {
         Platform::Macos => {
-            run_in_terminal(OPENCLAW_INSTALL_MACOS_COMMAND)?;
+            run_in_terminal(&openclaw_install_macos_command(mirror_mode))?;
             Ok(OpenClawInstallLaunchResult {
                 started: true,
                 strategy: "open-terminal".into(),
-                message: "已拉起 Terminal 执行 OpenClaw 官方安装脚本。安装完成后请返回本页重新检测。".into(),
+                message: format!(
+                    "已拉起 Terminal 执行 OpenClaw 官方安装脚本。默认检测目录已设为 {}；安装完成后请返回本页重新检测。",
+                    default_scan_dir.display()
+                ),
             })
         }
         Platform::Windows => {
-            launch_openclaw_windows_installer()?;
+            launch_openclaw_windows_installer(mirror_mode)?;
             Ok(OpenClawInstallLaunchResult {
                 started: true,
                 strategy: "open-powershell".into(),
@@ -270,8 +290,21 @@ pub fn install_openclaw_inner() -> Result<OpenClawInstallLaunchResult, String> {
     }
 }
 
+pub fn register_openclaw_scan_dir_inner(path: String) -> Result<OpenClawScanPathResult, String> {
+    let normalized = normalize_openclaw_scan_dir_input(&path)?;
+    let registered = register_openclaw_scan_dir(normalized)?;
+
+    Ok(OpenClawScanPathResult {
+        path: registered.display().to_string(),
+        message: "已加入 OpenClaw 扫描目录，重新检测时会优先检查这里。".into(),
+        scan_paths: configured_openclaw_scan_dirs_as_strings(),
+    })
+}
+
 pub fn switch_mirror_mode_inner(mode: MirrorMode) -> Result<MirrorSwitchResult, String> {
-    save_app_settings(AppSettings { mirror_mode: mode })?;
+    let mut settings = load_app_settings();
+    settings.mirror_mode = mode;
+    save_app_settings(settings)?;
     update_npm_mirror(mode)?;
 
     Ok(MirrorSwitchResult {
@@ -555,32 +588,36 @@ fn probe_homebrew() -> ProbeResult {
 }
 
 fn probe_openclaw_version() -> ProbeResult {
-    let output = run_command_with_timeout("openclaw", &["--version"], PROBE_TIMEOUT);
+    let output = run_openclaw_command_with_timeout(&["--version"], PROBE_TIMEOUT);
     normalize_probe(output, parse_version_like, None)
 }
 
 fn probe_openclaw_runtime_status() -> OpenClawRuntimeStatus {
-    let candidates: [&[&str]; 4] = [
-        &["gateway", "status", "--json"],
-        &["gateway", "status"],
-        &["status", "--deep", "--json"],
-        &["status"],
-    ];
-
-    for args in candidates {
-        if let Ok(raw) = run_command_with_timeout("openclaw", args, PROBE_TIMEOUT) {
-            let normalized = raw.to_ascii_lowercase();
-            if normalized.contains("running")
-                || normalized.contains("\"status\":\"ok\"")
-                || normalized.contains("\"ok\":true")
-                || normalized.contains("healthy")
-            {
-                return OpenClawRuntimeStatus::Running;
+    for args in [&["gateway", "status", "--json"][..], &["gateway", "status"][..]] {
+        match run_openclaw_command_with_timeout(args, PROBE_TIMEOUT) {
+            Ok(raw) => {
+                return if openclaw_runtime_is_running(&raw) {
+                    OpenClawRuntimeStatus::Running
+                } else {
+                    OpenClawRuntimeStatus::Stopped
+                };
             }
+            Err(error) if error == "missing" => return OpenClawRuntimeStatus::Stopped,
+            Err(_) => continue,
         }
     }
 
     OpenClawRuntimeStatus::Stopped
+}
+
+fn openclaw_runtime_is_running(raw: &str) -> bool {
+    let normalized = raw.to_ascii_lowercase().replace(char::is_whitespace, "");
+    normalized.contains("\"status\":\"running\"")
+        || normalized.contains("\"status\":\"ok\"")
+        || normalized.contains("\"ok\":true")
+        || normalized.contains("\"loaded\":true")
+        || normalized.contains("healthy")
+        || normalized.contains("runtime:running")
 }
 
 fn normalize_probe(
@@ -641,17 +678,94 @@ fn probe_command<const N: usize>(program: &str, args: [&str; N]) -> Result<Strin
     run_command_with_timeout(program, &args, PROBE_TIMEOUT)
 }
 
+fn run_openclaw_command_with_timeout(
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut last_error = "missing".to_string();
+
+    for candidate in openclaw_command_candidates() {
+        match run_command_with_timeout(&candidate, args, timeout) {
+            Err(error) if error == "missing" => continue,
+            Ok(output) => return Ok(output),
+            Err(error) => {
+                last_error = error;
+                break;
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
+fn openclaw_command_candidates() -> Vec<String> {
+    openclaw_command_candidates_for_dirs(&configured_openclaw_scan_dirs(), env::consts::OS)
+}
+
+#[cfg(test)]
+fn openclaw_command_candidates_for_home(home: Option<&Path>, os: &str) -> Vec<String> {
+    openclaw_command_candidates_for_dirs(&default_openclaw_bin_dirs_for_home(home), os)
+}
+
+fn openclaw_binary_names_for_os(os: &str) -> &'static [&'static str] {
+    match os {
+        "windows" => &["openclaw.cmd", "openclaw.exe", "openclaw.ps1", "openclaw"],
+        _ => &["openclaw"],
+    }
+}
+
+fn openclaw_command_candidates_for_dirs(bin_dirs: &[PathBuf], os: &str) -> Vec<String> {
+    let mut candidates = vec!["openclaw".to_string()];
+    let default_programs = openclaw_binary_names_for_os(os);
+
+    for bin_dir in bin_dirs {
+        for program in default_programs {
+            let path = bin_dir.join(program);
+            let path_str = path.to_string_lossy().to_string();
+            if !candidates.contains(&path_str) {
+                candidates.push(path_str);
+            }
+        }
+    }
+
+    candidates
+}
+
+#[cfg(test)]
+fn default_openclaw_bin_dirs_for_home(home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+
+    vec![home.join(".openclaw").join("bin")]
+}
+
+fn with_openclaw_bin_in_path(command: &mut Command) {
+    let mut extra_paths = configured_openclaw_scan_dirs();
+
+    if extra_paths.is_empty() {
+        return;
+    }
+
+    if let Some(current_path) = env::var_os("PATH") {
+        extra_paths.extend(env::split_paths(&current_path));
+    }
+
+    if let Ok(joined_paths) = env::join_paths(extra_paths) {
+        command.env("PATH", joined_paths);
+    }
+}
+
 fn run_command_with_timeout(
     program: &str,
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
-    let mut child = match Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    let mut command = Command::new(program);
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    with_openclaw_bin_in_path(&mut command);
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err("missing".into()),
         Err(error) => return Err(error.to_string()),
@@ -894,6 +1008,14 @@ brew install git"
     }
 }
 
+fn openclaw_install_macos_command(_mirror_mode: MirrorMode) -> String {
+    format!(
+        "export npm_config_registry='{OPENCLAW_NPM_REGISTRY_OFFICIAL}'; \
+export OPENCLAW_NPM_LOGLEVEL='error'; \
+curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install-cli.sh | bash -s -- --no-onboard"
+    )
+}
+
 fn resolve_git_windows_download_url() -> Result<String, String> {
     let is_arm = env::consts::ARCH == "aarch64";
     resolve_asset_url(
@@ -1024,12 +1146,14 @@ fn run_in_terminal(command: &str) -> Result<(), String> {
         })
 }
 
-fn launch_openclaw_windows_installer() -> Result<(), String> {
+fn launch_openclaw_windows_installer(_mirror_mode: MirrorMode) -> Result<(), String> {
     Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
-            "Start-Process powershell -ArgumentList '-NoExit','-Command','& ([scriptblock]::Create((iwr -useb https://openclaw.ai/install.ps1))) -NoOnboard'",
+            &format!(
+                "Start-Process powershell -ArgumentList '-NoExit','-Command',\"$env:npm_config_registry='{OPENCLAW_NPM_REGISTRY_OFFICIAL}'; & ([scriptblock]::Create((iwr -useb https://openclaw.ai/install.ps1))) -NoOnboard\""
+            ),
         ])
         .status()
         .map_err(|error| error.to_string())
@@ -1043,18 +1167,11 @@ fn launch_openclaw_windows_installer() -> Result<(), String> {
 }
 
 fn load_openclaw_provider_catalog() -> Result<Vec<OpenClawProviderCatalog>, String> {
-    let raw = run_command_with_timeout(
-        "openclaw",
+    let raw = run_openclaw_command_with_timeout(
         &["models", "list", "--all", "--json"],
         OPENCLAW_MODELS_TIMEOUT,
     )
-    .or_else(|_| {
-        run_command_with_timeout(
-            "openclaw",
-            &["models", "list", "--all"],
-            OPENCLAW_MODELS_TIMEOUT,
-        )
-    })?;
+    .or_else(|_| run_openclaw_command_with_timeout(&["models", "list", "--all"], OPENCLAW_MODELS_TIMEOUT))?;
 
     Ok(parse_openclaw_provider_catalog(&raw))
 }
@@ -1245,6 +1362,17 @@ fn http_client() -> Result<Client, String> {
         .map_err(|error| error.to_string())
 }
 
+fn default_mirror_mode() -> MirrorMode {
+    MirrorMode::Official
+}
+
+fn default_app_settings() -> AppSettings {
+    AppSettings {
+        mirror_mode: default_mirror_mode(),
+        openclaw_scan_dirs: Vec::new(),
+    }
+}
+
 fn app_settings_path() -> Result<PathBuf, String> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -1256,20 +1384,14 @@ fn app_settings_path() -> Result<PathBuf, String> {
 
 fn load_app_settings() -> AppSettings {
     let Ok(path) = app_settings_path() else {
-        return AppSettings {
-            mirror_mode: MirrorMode::Official,
-        };
+        return default_app_settings();
     };
 
     let Ok(contents) = fs::read_to_string(path) else {
-        return AppSettings {
-            mirror_mode: MirrorMode::Official,
-        };
+        return default_app_settings();
     };
 
-    serde_json::from_str(&contents).unwrap_or(AppSettings {
-        mirror_mode: MirrorMode::Official,
-    })
+    serde_json::from_str(&contents).unwrap_or_else(|_| default_app_settings())
 }
 
 fn save_app_settings(settings: AppSettings) -> Result<(), String> {
@@ -1280,6 +1402,157 @@ fn save_app_settings(settings: AppSettings) -> Result<(), String> {
 
     let payload = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
     fs::write(path, payload).map_err(|error| error.to_string())
+}
+
+fn default_openclaw_bin_dir() -> Result<PathBuf, String> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "无法定位当前用户目录。".to_string())?;
+
+    Ok(home.join(".openclaw").join("bin"))
+}
+
+fn configured_openclaw_scan_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    push_unique_paths(&mut dirs, detect_openclaw_bin_dirs());
+
+    for raw_dir in load_app_settings().openclaw_scan_dirs {
+        let path = PathBuf::from(raw_dir);
+        push_unique_path(&mut dirs, path);
+    }
+
+    if dirs.is_empty() {
+        if let Ok(default_dir) = default_openclaw_bin_dir() {
+            dirs.push(default_dir);
+        }
+    }
+
+    dirs
+}
+
+fn configured_openclaw_scan_dirs_as_strings() -> Vec<String> {
+    configured_openclaw_scan_dirs()
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+fn detect_openclaw_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(path_dir) = detect_openclaw_dir_from_path() {
+        push_unique_path(&mut dirs, path_dir);
+    }
+
+    if let Ok(default_dir) = default_openclaw_bin_dir() {
+        for binary_name in openclaw_binary_names_for_os(env::consts::OS) {
+            let candidate = default_dir.join(binary_name);
+            if candidate.is_file() {
+                push_unique_path(&mut dirs, default_dir.clone());
+                break;
+            }
+        }
+    }
+
+    dirs
+}
+
+fn detect_openclaw_dir_from_path() -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+
+    for dir in env::split_paths(&path) {
+        for binary_name in openclaw_binary_names_for_os(env::consts::OS) {
+            let candidate = dir.join(binary_name);
+            if candidate.is_file() {
+                return Some(dir);
+            }
+        }
+    }
+
+    None
+}
+
+fn push_unique_paths(target: &mut Vec<PathBuf>, values: Vec<PathBuf>) {
+    for value in values {
+        push_unique_path(target, value);
+    }
+}
+
+fn push_unique_path(target: &mut Vec<PathBuf>, value: PathBuf) {
+    if !target.contains(&value) {
+        target.push(value);
+    }
+}
+
+fn normalize_openclaw_scan_dir_input(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("请先输入 OpenClaw 所在目录。".into());
+    }
+
+    let expanded = expand_tilde_path(trimmed)?;
+    let normalized = if looks_like_openclaw_program_path(&expanded) {
+        expanded
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "无法解析 OpenClaw 可执行文件所在目录。".to_string())?
+    } else {
+        expanded
+    };
+
+    if !normalized.exists() {
+        return Err("该目录不存在，请确认后再保存。".into());
+    }
+
+    if !normalized.is_dir() {
+        return Err("请输入 OpenClaw 可执行文件所在目录，而不是普通文件。".into());
+    }
+
+    Ok(normalized)
+}
+
+fn expand_tilde_path(raw: &str) -> Result<PathBuf, String> {
+    if raw == "~" || raw.starts_with("~/") {
+        let home = env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .ok_or_else(|| "无法定位当前用户目录。".to_string())?;
+
+        if raw == "~" {
+            return Ok(home);
+        }
+
+        return Ok(home.join(raw.trim_start_matches("~/")));
+    }
+
+    Ok(PathBuf::from(raw))
+}
+
+fn looks_like_openclaw_program_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let normalized = name.to_ascii_lowercase();
+            matches!(
+                normalized.as_str(),
+                "openclaw" | "openclaw.cmd" | "openclaw.exe" | "openclaw.ps1"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn register_openclaw_scan_dir(dir: PathBuf) -> Result<PathBuf, String> {
+    let mut settings = load_app_settings();
+    let dir_str = dir.display().to_string();
+
+    if !settings.openclaw_scan_dirs.iter().any(|item| item == &dir_str) {
+        settings.openclaw_scan_dirs.push(dir_str);
+        save_app_settings(settings)?;
+    }
+
+    Ok(dir)
 }
 
 fn update_npm_mirror(mode: MirrorMode) -> Result<(), String> {
@@ -1397,6 +1670,32 @@ mod tests {
             parse_brew_version("Homebrew 4.4.20"),
             Some("4.4.20".into())
         );
+    }
+
+    #[test]
+    fn openclaw_candidates_include_default_install_dir_on_macos() {
+        let candidates = openclaw_command_candidates_for_home(
+            Some(Path::new("/Users/tester")),
+            "macos",
+        );
+
+        assert_eq!(candidates.first().map(String::as_str), Some("openclaw"));
+        assert!(candidates
+            .iter()
+            .any(|item| item == "/Users/tester/.openclaw/bin/openclaw"));
+    }
+
+    #[test]
+    fn runtime_probe_recognizes_running_output() {
+        assert!(openclaw_runtime_is_running(r#"{"rpc":{"ok":true},"service":{"loaded":true}}"#));
+        assert!(openclaw_runtime_is_running(r#"Runtime: running"#));
+    }
+
+    #[test]
+    fn runtime_probe_recognizes_stopped_output() {
+        assert!(!openclaw_runtime_is_running(
+            r#"{"service":{"loaded":false},"runtime":{"status":"unknown"},"rpc":{"ok":false}}"#
+        ));
     }
 
     #[test]

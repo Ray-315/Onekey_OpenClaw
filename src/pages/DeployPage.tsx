@@ -30,6 +30,7 @@ import {
   fetchOpenClawCatalog,
   installOpenClaw,
   isTauriRuntime,
+  registerOpenClawScanDir,
 } from "@/lib/tauri";
 import type {
   DeployAuthMode,
@@ -508,7 +509,7 @@ function buildStagePlan(config: DeployConfig, catalog: OpenClawCatalog | null): 
     {
       id: "verify",
       title: "验证启动结果",
-      detail: "检查 Gateway、provider 凭据与部署完成后的下一步设置入口",
+      detail: "检查 Gateway 与 provider 凭据，确认部署配置可以正常启动。",
     },
   ];
 }
@@ -519,21 +520,36 @@ function openExternalLink(url: string) {
 
 function InstallOpenClawView({
   catalog,
-  loading,
+  refreshing,
   installing,
+  savingScanPath,
   message,
   error,
+  manualScanPath,
+  scanPaths,
   onInstall,
+  onManualScanPathChange,
+  onSaveScanPath,
   onRefresh,
 }: {
   catalog: OpenClawCatalog | null;
-  loading: boolean;
+  refreshing: boolean;
   installing: boolean;
+  savingScanPath: boolean;
   message: string | null;
   error: string | null;
+  manualScanPath: string;
+  scanPaths: string[];
   onInstall: () => void;
+  onManualScanPathChange: (value: string) => void;
+  onSaveScanPath: () => void;
   onRefresh: () => void;
 }) {
+  const primaryScanPath = scanPaths[0] ?? null;
+  const scanPathPlaceholder = primaryScanPath
+    ? `例如 ${primaryScanPath} 或 /Users/mac/custom/openclaw/bin`
+    : "例如 /Users/mac/.openclaw/bin 或 /Users/mac/custom/openclaw/bin";
+
   return (
     <section className="space-y-6">
       <Card className="overflow-hidden border-border/70">
@@ -542,11 +558,10 @@ function InstallOpenClawView({
             <Badge variant="info">OpenClaw · 一键部署</Badge>
             <h3 className="mt-4 text-3xl font-semibold tracking-tight">先安装 OpenClaw，才能继续部署</h3>
             <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">
-              这页现在不会在安装前展示模型和 provider 选择器。OpenClaw 安装完成后，系统会直接通过
-              CLI 读取可用的模型公司和模型，再进入真正的部署配置。
+              安装完成后，这一页会直接从本机 OpenClaw 读取可用的 provider、模型和授权方式，再生成部署配置。
             </p>
             <div className="mt-6 flex flex-wrap gap-3">
-              <Button disabled={installing || loading} onClick={onInstall}>
+              <Button disabled={installing} onClick={onInstall}>
                 {installing ? (
                   <LoaderCircle className="size-4 animate-spin" />
                 ) : (
@@ -554,8 +569,8 @@ function InstallOpenClawView({
                 )}
                 {installing ? "安装脚本已拉起" : "安装 OpenClaw"}
               </Button>
-              <Button disabled={loading} onClick={onRefresh} variant="outline">
-                {loading ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+              <Button disabled={refreshing} onClick={onRefresh} variant="outline">
+                {refreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
                 重新检测
               </Button>
             </div>
@@ -563,9 +578,12 @@ function InstallOpenClawView({
 
           <div className="space-y-4 p-6">
             <div className="rounded-[28px] border border-border/70 bg-foreground/5 p-5">
-              <p className="text-sm text-muted-foreground">当前状态</p>
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-sm text-muted-foreground">当前状态</p>
+                {refreshing ? <Badge variant="info">后台刷新中</Badge> : null}
+              </div>
               <p className="mt-2 text-2xl font-semibold">
-                {catalog?.installed ? "已安装" : loading ? "检测中" : "未安装"}
+                {catalog?.installed ? "已安装" : catalog ? "未安装" : "检测中"}
               </p>
               <p className="mt-3 text-sm leading-6 text-muted-foreground">
                 {message ?? catalog?.message ?? "安装完成后，点击重新检测继续。"}
@@ -573,14 +591,62 @@ function InstallOpenClawView({
             </div>
 
             <div className="rounded-[28px] border border-border/70 bg-background/80 p-5">
-              <p className="text-sm font-medium">下一步</p>
-              <div className="mt-4 space-y-3 text-sm leading-6 text-muted-foreground">
+              <p className="text-sm font-medium">安装说明</p>
+              <div className="mt-4 text-sm leading-6 text-muted-foreground">
                 <div className="rounded-2xl border border-border/70 px-4 py-3">
-                  安装完成后点“重新检测”，页面会解锁模型、授权和部署配置。
+                  安装完成后点击“重新检测”，即可进入部署配置。
+                  {primaryScanPath ? (
+                    <>
+                      当前默认检测目录是 <span className="font-mono text-foreground">{primaryScanPath}</span>。
+                    </>
+                  ) : (
+                    <> 默认会优先检测当前用户目录下的 `.openclaw/bin`。</>
+                  )}
                 </div>
-                <div className="rounded-2xl border border-border/70 px-4 py-3">
-                  模型列表直接来自 OpenClaw CLI，不再使用前端硬编码。
-                </div>
+              </div>
+            </div>
+
+            <div className="rounded-[28px] border border-border/70 bg-background/80 p-5">
+              <p className="text-sm font-medium">扫描目录</p>
+              <div className="mt-4 flex flex-wrap gap-2">
+                {scanPaths.length > 0 ? (
+                  scanPaths.map((path) => (
+                    <span
+                      key={path}
+                      className="rounded-full border border-border/70 bg-foreground/4 px-3 py-1 text-xs text-muted-foreground"
+                    >
+                      {path}
+                    </span>
+                  ))
+                ) : (
+                  <span className="rounded-full border border-dashed border-border/70 px-3 py-1 text-xs text-muted-foreground">
+                    自动检测中
+                  </span>
+                )}
+              </div>
+              <p className="mt-4 text-sm leading-6 text-muted-foreground">
+                安装 OpenClaw 时会自动登记默认目录；如果你用了自定义安装位置，也可以在这里手动指定目录。
+              </p>
+              <input
+                className={inputClassName()}
+                onChange={(event) => onManualScanPathChange(event.target.value)}
+                placeholder={scanPathPlaceholder}
+                type="text"
+                value={manualScanPath}
+              />
+              <div className="mt-3">
+                <Button
+                  disabled={savingScanPath || manualScanPath.trim().length === 0}
+                  onClick={onSaveScanPath}
+                  variant="outline"
+                >
+                  {savingScanPath ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <FolderCog className="size-4" />
+                  )}
+                  {savingScanPath ? "保存中" : "保存目录并重新检测"}
+                </Button>
               </div>
             </div>
           </div>
@@ -603,6 +669,9 @@ export function DeployPage() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [installingOpenClaw, setInstallingOpenClaw] = useState(false);
+  const [savingScanPath, setSavingScanPath] = useState(false);
+  const [manualScanPath, setManualScanPath] = useState("");
+  const [scanPaths, setScanPaths] = useState<string[]>([]);
   const [config, setConfig] = useState<DeployConfig>(() => buildPlanConfig("quickstart"));
   const [configModalOpen, setConfigModalOpen] = useState(false);
   const [loginStatus, setLoginStatus] = useState<LoginStatus>("idle");
@@ -618,6 +687,7 @@ export function DeployPage() {
     try {
       const result = await fetchOpenClawCatalog();
       setCatalog(result);
+      setScanPaths(result.scanPaths);
       setCatalogState("ready");
       setStatusMessage(nextMessage ?? result.message);
     } catch (catalogError) {
@@ -766,6 +836,27 @@ export function DeployPage() {
     }
   }
 
+  async function handleSaveScanPath() {
+    setSavingScanPath(true);
+    setError(null);
+
+    try {
+      const result = await registerOpenClawScanDir(manualScanPath);
+      setScanPaths(result.scanPaths);
+      setStatusMessage(result.message);
+      setManualScanPath("");
+      await refreshCatalog(result.message);
+    } catch (scanPathError) {
+      setError(
+        scanPathError instanceof Error
+          ? scanPathError.message
+          : "保存 OpenClaw 扫描目录失败，请稍后重试。",
+      );
+    } finally {
+      setSavingScanPath(false);
+    }
+  }
+
   function applyPlan(planId: PlanId) {
     setConfig((current) => ({ ...buildPlanConfig(planId), installDir: current.installDir, workspaceDir: current.workspaceDir }));
     setLoginStatus("idle");
@@ -907,9 +998,16 @@ export function DeployPage() {
         error={error}
         installing={installingOpenClaw}
         loading={catalogState === "loading"}
+        manualScanPath={manualScanPath}
         message={statusMessage}
+        savingScanPath={savingScanPath}
+        scanPaths={scanPaths}
         onInstall={() => {
           void handleInstallOpenClaw();
+        }}
+        onManualScanPathChange={setManualScanPath}
+        onSaveScanPath={() => {
+          void handleSaveScanPath();
         }}
         onRefresh={() => {
           void refreshCatalog();

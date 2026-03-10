@@ -57,6 +57,7 @@ export interface OpenClawCatalog {
   version?: string | null;
   message: string;
   runtimeStatus: OpenClawRuntimeStatus;
+  scanPaths: string[];
   providers: OpenClawProviderCatalog[];
 }
 
@@ -64,4 +65,10 @@ export interface OpenClawInstallLaunchResult {
   started: boolean;
   strategy: string;
   message: string;
+}
+
+export interface OpenClawScanPathResult {
+  path: string;
+  message: string;
+  scanPaths: string[];
 }

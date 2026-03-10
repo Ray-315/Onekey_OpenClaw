@@ -3,11 +3,10 @@ import {
   BookTemplate,
   Box,
   ChevronRight,
-  LoaderCircle,
   Settings2,
   Sparkles,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 
 import { ModeToggle } from "@/components/app/mode-toggle";
@@ -26,8 +25,12 @@ const items = [
 
 type ShellStatusTone = "danger" | "warning" | "success" | "neutral";
 
-function deriveOpenClawStatus(scan: EnvironmentScan | null, catalog: OpenClawCatalog | null) {
-  if (!scan) {
+function deriveOpenClawStatus(
+  scan: EnvironmentScan | null,
+  catalog: OpenClawCatalog | null,
+  loading: boolean,
+) {
+  if (loading && !scan && !catalog) {
     return {
       tone: "neutral" as ShellStatusTone,
       label: "检测中",
@@ -35,7 +38,7 @@ function deriveOpenClawStatus(scan: EnvironmentScan | null, catalog: OpenClawCat
     };
   }
 
-  if (!scan.overallReady) {
+  if (!scan || !scan.overallReady) {
     return {
       tone: "danger" as ShellStatusTone,
       label: "环境未适配",
@@ -79,6 +82,11 @@ export function AppShell() {
   const [scan, setScan] = useState<EnvironmentScan | null>(null);
   const [catalog, setCatalog] = useState<OpenClawCatalog | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
+  const [animateStatusDot, setAnimateStatusDot] = useState(false);
+  const [displayedStatus, setDisplayedStatus] = useState(() =>
+    deriveOpenClawStatus(null, null, true),
+  );
+  const statusAnimationTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -93,8 +101,12 @@ export function AppShell() {
         return;
       }
 
-      setScan(scanResult.status === "fulfilled" ? scanResult.value : null);
-      setCatalog(catalogResult.status === "fulfilled" ? catalogResult.value : null);
+      if (scanResult.status === "fulfilled") {
+        setScan(scanResult.value);
+      }
+      if (catalogResult.status === "fulfilled") {
+        setCatalog(catalogResult.value);
+      }
       setStatusLoading(false);
     }
 
@@ -106,7 +118,42 @@ export function AppShell() {
     };
   }, [location.pathname]);
 
-  const openClawStatus = deriveOpenClawStatus(scan, catalog);
+  useEffect(() => {
+    const nextStatus = deriveOpenClawStatus(scan, catalog, statusLoading);
+    const currentVisualKey = `${displayedStatus.tone}:${displayedStatus.label}`;
+    const nextVisualKey = `${nextStatus.tone}:${nextStatus.label}`;
+    const detailChanged = displayedStatus.detail !== nextStatus.detail;
+    const visualChanged = currentVisualKey !== nextVisualKey;
+
+    if (!detailChanged && !visualChanged) {
+      return;
+    }
+
+    setDisplayedStatus(nextStatus);
+
+    if (!visualChanged) {
+      return;
+    }
+
+    setAnimateStatusDot(true);
+
+    if (statusAnimationTimerRef.current !== null) {
+      window.clearTimeout(statusAnimationTimerRef.current);
+    }
+
+    statusAnimationTimerRef.current = window.setTimeout(() => {
+      setAnimateStatusDot(false);
+      statusAnimationTimerRef.current = null;
+    }, 650);
+  }, [catalog, displayedStatus.detail, displayedStatus.label, displayedStatus.tone, scan, statusLoading]);
+
+  useEffect(() => {
+    return () => {
+      if (statusAnimationTimerRef.current !== null) {
+        window.clearTimeout(statusAnimationTimerRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div className="relative min-h-screen overflow-hidden">
@@ -168,14 +215,16 @@ export function AppShell() {
               <div className="rounded-[24px] border border-border/70 bg-foreground/4 p-4">
                 <div className="flex items-center justify-between gap-3">
                   <p className="text-sm font-medium">OpenClaw 状态</p>
-                  {statusLoading ? (
-                    <LoaderCircle className="size-4 animate-spin text-muted-foreground" />
-                  ) : (
-                    <span className={cn("size-2.5 rounded-full", dotClasses[openClawStatus.tone])} />
-                  )}
+                  <span
+                    className={cn(
+                      "size-2.5 rounded-full",
+                      dotClasses[displayedStatus.tone],
+                      animateStatusDot ? "status-dot-flash" : "",
+                    )}
+                  />
                 </div>
-                <p className="mt-3 text-base font-semibold">{openClawStatus.label}</p>
-                <p className="mt-2 text-sm leading-6 text-muted-foreground">{openClawStatus.detail}</p>
+                <p className="mt-3 text-base font-semibold">{displayedStatus.label}</p>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">{displayedStatus.detail}</p>
               </div>
             </div>
           </Card>

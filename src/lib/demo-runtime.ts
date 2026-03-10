@@ -6,6 +6,7 @@ import type {
   InstallLaunchResult,
   OpenClawCatalog,
   OpenClawInstallLaunchResult,
+  OpenClawScanPathResult,
   OpenClawRuntimeStatus,
   MirrorMode,
   MirrorSwitchResult,
@@ -23,6 +24,7 @@ interface DemoRuntimeState {
   gitVersion: string | null;
   homebrewVersion: string | null;
   openclawVersion: string | null;
+  openclawScanPaths: string[];
 }
 
 function detectPlatform(): Platform {
@@ -39,6 +41,7 @@ function defaultState(): DemoRuntimeState {
     gitVersion: null,
     homebrewVersion: null,
     openclawVersion: null,
+    openclawScanPaths: ["~/.openclaw/bin"],
   };
 }
 
@@ -58,6 +61,10 @@ function loadState(): DemoRuntimeState {
         parsed.mirrorMode === "china" || parsed.mirrorMode === "official"
           ? parsed.mirrorMode
           : defaultState().mirrorMode,
+      openclawScanPaths:
+        Array.isArray(parsed.openclawScanPaths) && parsed.openclawScanPaths.length > 0
+          ? parsed.openclawScanPaths.filter((item): item is string => typeof item === "string")
+          : defaultState().openclawScanPaths,
     };
   } catch {
     return defaultState();
@@ -323,6 +330,7 @@ export function buildDemoOpenClawCatalog(): OpenClawCatalog {
       version: null,
       message: "Demo 中尚未安装 OpenClaw。请先点击安装按钮，再继续选择模型公司和模型。",
       runtimeStatus: "stopped",
+      scanPaths: state.openclawScanPaths,
       providers: [],
     };
   }
@@ -332,6 +340,7 @@ export function buildDemoOpenClawCatalog(): OpenClawCatalog {
     version: state.openclawVersion,
     message: "Demo 已模拟安装 OpenClaw，可用模型列表来自本地示例数据。",
     runtimeStatus: "stopped" satisfies OpenClawRuntimeStatus,
+    scanPaths: state.openclawScanPaths,
     providers: [
       {
         id: "zai",
@@ -410,12 +419,36 @@ export function buildDemoOpenClawCatalog(): OpenClawCatalog {
 export function applyDemoOpenClawInstall(): OpenClawInstallLaunchResult {
   const state = loadState();
   state.openclawVersion = "0.91.0";
+  if (!state.openclawScanPaths.includes("~/.openclaw/bin")) {
+    state.openclawScanPaths.unshift("~/.openclaw/bin");
+  }
   saveState(state);
 
   return {
     started: true,
     strategy: "preview",
-    message: "Demo 已模拟安装 OpenClaw 0.91.0。现在可以继续选择可用 provider 和模型。",
+    message: "Demo 已模拟安装 OpenClaw 0.91.0，并自动登记 ~/.openclaw/bin 作为扫描目录。",
+  };
+}
+
+export function applyDemoOpenClawScanDir(path: string): OpenClawScanPathResult {
+  const state = loadState();
+  const normalized = path.trim();
+
+  if (!normalized) {
+    throw new Error("请先输入 OpenClaw 所在目录。");
+  }
+
+  if (!state.openclawScanPaths.includes(normalized)) {
+    state.openclawScanPaths.push(normalized);
+  }
+
+  saveState(state);
+
+  return {
+    path: normalized,
+    message: "Demo 已加入手动扫描目录，重新检测时会优先检查这里。",
+    scanPaths: state.openclawScanPaths,
   };
 }
 

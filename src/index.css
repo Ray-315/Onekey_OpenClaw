@@ -109,6 +109,23 @@
 }
 
 @layer utilities {
+  @keyframes status-dot-flash {
+    0% {
+      opacity: 0.45;
+      transform: scale(0.72);
+    }
+
+    55% {
+      opacity: 1;
+      transform: scale(1.45);
+    }
+
+    100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
   .glass-panel {
     background: var(--card);
     backdrop-filter: blur(22px);
@@ -118,5 +135,9 @@
     background-image:
       linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, transparent 45%),
       linear-gradient(315deg, rgba(15, 23, 42, 0.04) 0%, transparent 55%);
+  }
+
+  .status-dot-flash {
+    animation: status-dot-flash 0.65s ease-out 1;
   }
 }

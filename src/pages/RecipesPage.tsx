@@ -13,7 +13,7 @@ export function RecipesPage() {
               <Badge variant="info">按配方部署</Badge>
               <h3 className="mt-4 text-3xl font-semibold tracking-tight">社区配方入口正在开发中</h3>
               <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">
-                这一页后续会接入社区配方列表、详情预览和一键导入。当前先不展开未完成的页面结构，避免把半成品内容直接摊开。
+                社区配方功能暂未开放。开放后可直接浏览社区模板、查看详情，并一键导入部署。
               </p>
 
               <div className="mt-6 grid gap-3 md:grid-cols-3">
@@ -61,7 +61,7 @@ export function RecipesPage() {
                 </Badge>
                 <h4 className="mt-4 text-2xl font-semibold tracking-tight">敬请期待</h4>
                 <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                  当前暂不开放交互，等社区配方链路接完后再展开完整页面。
+                  该功能开放后，可直接从社区导入配方并进入部署流程。
                 </p>
               </div>
             </div>
