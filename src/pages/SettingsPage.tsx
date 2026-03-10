@@ -82,6 +82,13 @@ export function SettingsPage() {
                 >
                   一键部署
                 </Button>
+                <Button
+                  onClick={() => updateSettings({ startPage: "runtime" })}
+                  size="sm"
+                  variant={settings.startPage === "runtime" ? "default" : "outline"}
+                >
+                  启动控制
+                </Button>
               </div>
             </div>
 

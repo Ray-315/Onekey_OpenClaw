@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState, type PropsWithChildren } from "react";
 
-export type StartPage = "diagnostics" | "deploy";
+export type StartPage = "diagnostics" | "deploy" | "runtime";
 
 export interface WorkbenchSettings {
   startPage: StartPage;
@@ -33,7 +33,12 @@ function loadWorkbenchSettings(): WorkbenchSettings {
   try {
     const parsed = JSON.parse(raw) as Partial<WorkbenchSettings>;
     return {
-      startPage: parsed.startPage === "deploy" ? "deploy" : "diagnostics",
+      startPage:
+        parsed.startPage === "deploy"
+          ? "deploy"
+          : parsed.startPage === "runtime"
+            ? "runtime"
+            : "diagnostics",
       focusRescan: parsed.focusRescan ?? defaultSettings.focusRescan,
       showInstallNotice: parsed.showInstallNotice ?? defaultSettings.showInstallNotice,
     };

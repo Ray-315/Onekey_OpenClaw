@@ -5,7 +5,7 @@ import { AppShell } from "@/components/app/app-shell";
 import { ThemeProvider } from "@/components/app/theme-provider";
 
 describe("AppShell", () => {
-  it("renders four primary navigation entries", () => {
+  it("renders primary navigation entries", () => {
     render(
       <ThemeProvider>
         <MemoryRouter initialEntries={["/diagnostics"]}>
@@ -20,7 +20,8 @@ describe("AppShell", () => {
 
     expect(screen.getAllByRole("link", { name: /环境检测/i }).length).toBeGreaterThan(0);
     expect(screen.getAllByRole("link", { name: /一键部署/i }).length).toBeGreaterThan(0);
-    expect(screen.getAllByRole("link", { name: /按配方部署/i }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("link", { name: /启动控制/i }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("link", { name: /skills 商店/i }).length).toBeGreaterThan(0);
     expect(screen.getAllByRole("link", { name: /设置/i }).length).toBeGreaterThan(0);
   });
 });

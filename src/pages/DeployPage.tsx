@@ -14,22 +14,25 @@ import {
   PackagePlus,
   Play,
   RefreshCw,
-  ShieldCheck,
-  Sparkles,
   TerminalSquare,
   Waypoints,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import { useWorkbenchSettings } from "@/components/app/app-settings-provider";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
+  applyOpenClawDeploy,
+  checkOpenClawAuth,
   fetchOpenClawCatalog,
   installOpenClaw,
   isTauriRuntime,
+  launchOpenClawAuth,
+  openExternalUrl,
   registerOpenClawScanDir,
 } from "@/lib/tauri";
 import type {
@@ -40,7 +43,7 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-type PlanId = "quickstart" | "stable";
+type PlanId = "quickstart" | "custom";
 type CatalogState = "loading" | "ready" | "error";
 type LoginStatus = "idle" | "running" | "connected";
 type LogLevel = "info" | "debug" | "warn";
@@ -49,7 +52,7 @@ interface PlanDefinition {
   id: PlanId;
   title: string;
   badge: string;
-  tone: "success" | "warning";
+  tone: "success" | "warning" | "neutral";
   summary: string;
   detail: string;
   preferredProviders: string[];
@@ -69,6 +72,19 @@ interface ProviderInsight {
   oauthNote?: string;
 }
 
+const providerLoginTransitions: Partial<Record<string, { login?: string[]; api?: string[] }>> = {
+  openai: { login: ["openai-codex"] },
+  "openai-codex": { api: ["openai"] },
+  google: { login: ["google-antigravity", "google-gemini-cli"] },
+  "google-antigravity": { api: ["google"] },
+  "google-gemini-cli": { api: ["google"] },
+  minimax: { login: ["minimax-portal"] },
+  "minimax-cn": { login: ["minimax-portal"] },
+  "minimax-portal": { api: ["minimax", "minimax-cn"] },
+  qwen: { login: ["qwen-portal"] },
+  "qwen-portal": { api: ["qwen"] },
+};
+
 interface SelectOption {
   value: string;
   label: string;
@@ -78,6 +94,7 @@ interface SelectOption {
 interface DeployConfig {
   planId: PlanId;
   primaryProviderId: string;
+  primaryProviderRouteId: string;
   primaryModelRef: string;
   authMode: DeployAuthMode;
   apiSecret: string;
@@ -92,17 +109,11 @@ interface DeployConfig {
   writeExampleRecipe: boolean;
 }
 
-interface DeployStage {
-  id: string;
-  title: string;
-  detail: string;
-}
-
 const plans: PlanDefinition[] = [
   {
     id: "quickstart",
     title: "快速体验",
-    badge: "先装 OpenClaw",
+    badge: "免费 · 快速",
     tone: "success",
     summary: "先安装 OpenClaw，再从 CLI 读取可用 provider 和模型，优先走免费额度或低门槛路线。",
     detail: "主推 Z.AI / GLM 与 MiniMax。安装完成前，不允许直接开始部署。",
@@ -110,15 +121,16 @@ const plans: PlanDefinition[] = [
     preferredModels: ["zai/glm-4.7", "zai/glm-5", "minimax/MiniMax-M2.5"],
   },
   {
-    id: "stable",
-    title: "稳定部署",
-    badge: "需要付费",
+    id: "custom",
+    title: "自定义",
+    badge: "可能付费 · 稳定",
     tone: "warning",
-    summary: "安装 OpenClaw 后，优先选择更稳定、更便宜但能力够用的官方模型入口。",
-    detail: "默认偏向 OpenAI 的低价档，也可改成 Anthropic 的网页登录流。",
-    preferredProviders: ["openai", "anthropic"],
+    summary: "默认偏向更稳定的官方模型入口，也允许你继续手动改下面的配置。",
+    detail: "主推 OpenAI Codex OAuth 与 Anthropic；改动模型、授权或部署选项后仍然归到自定义。",
+    preferredProviders: ["openai-codex", "anthropic", "openai"],
     preferredModels: [
-      "openai/gpt-5-mini",
+      "openai-codex/gpt-5.3-codex",
+      "openai-codex/gpt-5.4",
       "anthropic/claude-sonnet-4-5",
       "openai/gpt-5.4",
     ],
@@ -128,7 +140,7 @@ const plans: PlanDefinition[] = [
 const providerInsights: Record<string, ProviderInsight> = {
   zai: {
     title: "Z.AI / GLM",
-    summary: "免费 API 入口优先，适合把 OpenClaw 的第一条部署链路跑通。",
+    summary: "GLM 通过 Z.AI API Key 接入；这里单独暴露国内 / 国际线路。",
     primaryLabel: "申请智谱免费 API",
     primaryUrl: "https://open.bigmodel.cn/console/trialcenter",
     secondaryLabel: "查看 Z.AI 文档",
@@ -136,46 +148,164 @@ const providerInsights: Record<string, ProviderInsight> = {
     apiEnv: "ZAI_API_KEY",
   },
   minimax: {
-    title: "MiniMax",
-    summary: "适合先领注册额度做快速体验。OpenClaw 可通过 provider 配置直接接入。",
+    title: "MiniMax Global",
+    summary: "Global 站点。OpenClaw 里还有对应的 `minimax-cn` 线路，会单独显示出来。",
     primaryLabel: "申请 MiniMax 免费额度",
     primaryUrl: "https://www.minimax.io/pricing",
     secondaryLabel: "查看 MiniMax 文档",
     secondaryUrl: "https://docs.openclaw.ai/providers/minimax",
     apiEnv: "MINIMAX_API_KEY",
   },
+  "minimax-cn": {
+    title: "MiniMax CN",
+    summary: "国内线路，对应 OpenClaw 的 `minimax-cn/...` 模型引用。",
+    primaryLabel: "申请 MiniMax 国内额度",
+    primaryUrl: "https://www.minimaxi.com/",
+    secondaryLabel: "查看 MiniMax 文档",
+    secondaryUrl: "https://docs.openclaw.ai/providers/minimax",
+    apiEnv: "MINIMAX_API_KEY",
+  },
+  moonshot: {
+    title: "Moonshot / Kimi",
+    summary: "Moonshot 当前走 API Key；再按站点区分 Global / CN。",
+    primaryLabel: "查看 Moonshot 定价",
+    primaryUrl: "https://platform.moonshot.ai/docs/pricing/chat",
+    secondaryLabel: "查看 Moonshot 文档",
+    secondaryUrl: "https://docs.openclaw.ai/concepts/model-providers",
+    apiEnv: "MOONSHOT_API_KEY",
+  },
   openai: {
     title: "OpenAI",
-    summary: "稳定部署默认推荐项。可走 API Key，也可走网页登录式接入。",
+    summary: "稳定部署默认推荐项。这里走标准 OpenAI API Key。",
     primaryLabel: "查看 OpenAI 定价",
     primaryUrl: "https://openai.com/api/pricing/",
     secondaryLabel: "查看 OpenAI 文档",
     secondaryUrl: "https://docs.openclaw.ai/providers/openai",
     apiEnv: "OPENAI_API_KEY",
-    oauthLabel: "OAuth 登录",
+  },
+  "openai-codex": {
+    title: "OpenAI Codex",
+    summary: "走 OpenAI Codex OAuth。部署时会写入 `openai-codex/...` 模型，而不是普通 `openai/...`。",
+    primaryLabel: "查看 Codex OAuth 文档",
+    primaryUrl: "https://openai.com/chatgpt/download/",
+    secondaryLabel: "查看 OpenAI 文档",
+    secondaryUrl: "https://docs.openclaw.ai/providers/openai",
+    oauthLabel: "Codex OAuth",
     oauthCommand: "openclaw models auth login --provider openai-codex",
   },
   anthropic: {
     title: "Anthropic",
-    summary: "偏高质量路线。可以用 API Key，也可以走网页登录式授权。",
+    summary: "Anthropic 官方推荐 API Key；订阅用户则用 Claude setup-token。",
     primaryLabel: "查看 Claude 定价",
     primaryUrl: "https://platform.claude.com/docs/zh-CN/about-claude/pricing",
     secondaryLabel: "查看 Anthropic 文档",
     secondaryUrl: "https://docs.openclaw.ai/providers/anthropic",
     apiEnv: "ANTHROPIC_API_KEY",
-    oauthLabel: "OAuth 登录",
-    oauthCommand: "claude setup-token -> openclaw models auth setup-token --provider anthropic",
-    oauthNote: "Anthropic 底层真实接入会走 setup-token，界面统一收口为 OAuth 登录。",
+    oauthLabel: "Setup-token",
+    oauthCommand: "openclaw models auth setup-token --provider anthropic",
+    oauthNote: "Anthropic 实际会走 setup-token：如果终端提示你先运行 `claude setup-token`，按提示复制 token 再粘贴回来。",
   },
   google: {
     title: "Google Gemini",
-    summary: "适合已有 Gemini API 的团队，这一版只保留 API Key 路线。",
-    primaryLabel: "查看 Model Providers",
-    primaryUrl: "https://docs.openclaw.ai/concepts/model-providers",
-    secondaryLabel: "查看 Gemini 示例",
+    summary: "标准 `google/...` 走 Gemini API Key；Google 账号登录要切到 `google-antigravity` 或 `google-gemini-cli`。",
+    primaryLabel: "申请 Gemini API Key",
+    primaryUrl: "https://ai.google.dev/gemini-api/docs/api-key",
+    secondaryLabel: "查看 Google Provider 文档",
     secondaryUrl: "https://docs.openclaw.ai/concepts/model-providers",
-    apiEnv: "GEMINI_API_KEY",
+    apiEnv: "GOOGLE_API_KEY",
   },
+  "google-antigravity": {
+    title: "Google Antigravity",
+    summary: "这是 Google 账号登录路线，不用 API Key；先启用插件，再走浏览器账号授权。",
+    primaryLabel: "查看 Antigravity 文档",
+    primaryUrl: "https://docs.openclaw.ai/concepts/model-providers",
+    secondaryLabel: "查看插件列表",
+    secondaryUrl: "https://docs.openclaw.ai/plugins",
+    oauthLabel: "Google 账号登录",
+    oauthCommand:
+      "openclaw plugins enable google-antigravity-auth && openclaw models auth login --provider google-antigravity --set-default",
+    oauthNote: "Antigravity 是单独 provider，不是 `google/...` 的 API Key 模式。授权完成后会把 token 写进 OpenClaw 的 auth profiles。",
+  },
+  "google-gemini-cli": {
+    title: "Google Gemini CLI",
+    summary: "这条路线复用 Gemini CLI / Google 账号登录，不需要把 client id 或 secret 手工写进配置。",
+    primaryLabel: "查看 Gemini CLI 文档",
+    primaryUrl: "https://docs.openclaw.ai/concepts/model-providers",
+    secondaryLabel: "查看 Gemini CLI 官方站",
+    secondaryUrl: "https://geminicli.com/",
+    oauthLabel: "Gemini CLI 登录",
+    oauthCommand:
+      "openclaw plugins enable google-gemini-cli-auth && openclaw models auth login --provider google-gemini-cli --set-default",
+    oauthNote: "Gemini CLI 登录会把 token 存进 OpenClaw 的 auth profiles，不需要额外 API Key。",
+  },
+  "google-vertex": {
+    title: "Google Vertex",
+    summary: "Vertex 不是 API Key / OAuth 二选一，而是走 Google Cloud ADC（`gcloud auth application-default login`）。",
+    primaryLabel: "查看 Vertex 文档",
+    primaryUrl: "https://docs.openclaw.ai/concepts/model-providers",
+    secondaryLabel: "查看 Google Cloud ADC",
+    secondaryUrl: "https://cloud.google.com/docs/authentication/provide-credentials-adc",
+  },
+  "minimax-portal": {
+    title: "MiniMax OAuth",
+    summary: "MiniMax Coding Plan 支持 OAuth 订阅授权；按地域仍然区分 Global / CN 端点。",
+    primaryLabel: "查看 MiniMax OpenClaw 指南",
+    primaryUrl: "https://platform.minimax.io/docs/coding-plan/openclaw",
+    secondaryLabel: "查看 MiniMax 文档",
+    secondaryUrl: "https://docs.openclaw.ai/minimax/",
+    oauthLabel: "MiniMax OAuth",
+    oauthCommand:
+      "openclaw plugins enable minimax-portal-auth && openclaw onboard --auth-choice minimax-portal",
+    oauthNote: "如果 Gateway 已在运行，按官方文档需要重启后再使用 MiniMax OAuth。",
+  },
+  qwen: {
+    title: "Qwen",
+    summary: "Qwen 账号登录不是普通 API Key 路线，而是切到 `qwen-portal` provider 做设备码 OAuth。",
+    primaryLabel: "查看 Qwen 文档",
+    primaryUrl: "https://docs.openclaw.ai/providers/qwen",
+    secondaryLabel: "查看模型提供商总览",
+    secondaryUrl: "https://docs.openclaw.ai/concepts/model-providers",
+    apiEnv: "DASHSCOPE_API_KEY",
+  },
+  "qwen-portal": {
+    title: "Qwen OAuth",
+    summary: "Qwen Portal 提供设备码 OAuth，可复用 Qwen Code CLI 已有登录。",
+    primaryLabel: "查看 Qwen 文档",
+    primaryUrl: "https://docs.openclaw.ai/providers/qwen",
+    secondaryLabel: "查看插件列表",
+    secondaryUrl: "https://docs.openclaw.ai/plugins",
+    oauthLabel: "Qwen OAuth",
+    oauthCommand:
+      "openclaw plugins enable qwen-portal-auth && openclaw models auth login --provider qwen-portal --set-default",
+    oauthNote: "如果你已经登录过 Qwen Code CLI，OpenClaw 会同步已有凭据；首次仍建议先跑一次登录命令创建 provider 条目。",
+  },
+};
+
+const providerRouteOptionsByProvider: Record<string, SelectOption[]> = {
+  zai: [
+    {
+      value: "cn",
+      label: "BigModel CN",
+      hint: "open.bigmodel.cn · 智谱国内站",
+    },
+    {
+      value: "global",
+      label: "Z.AI Global",
+      hint: "api.z.ai · 国际站",
+    },
+  ],
+  moonshot: [
+    {
+      value: "global",
+      label: "Moonshot Global",
+      hint: "api.moonshot.ai",
+    },
+    {
+      value: "cn",
+      label: "Moonshot CN",
+      hint: "api.moonshot.cn",
+    },
+  ],
 };
 
 const logLevels: Array<{ id: LogLevel; title: string; hint: string }> = [
@@ -185,10 +315,11 @@ const logLevels: Array<{ id: LogLevel; title: string; hint: string }> = [
 ];
 
 function buildPlanConfig(planId: PlanId): DeployConfig {
-  if (planId === "stable") {
+  if (planId === "custom") {
     return {
       planId,
       primaryProviderId: "",
+      primaryProviderRouteId: "",
       primaryModelRef: "",
       authMode: "api",
       apiSecret: "",
@@ -207,6 +338,7 @@ function buildPlanConfig(planId: PlanId): DeployConfig {
   return {
     planId: "quickstart",
     primaryProviderId: "",
+    primaryProviderRouteId: "",
     primaryModelRef: "",
     authMode: "api",
     apiSecret: "",
@@ -251,8 +383,77 @@ function SelectMenu({
   emptyLabel = "暂无可选项",
 }: SelectMenuProps) {
   const [open, setOpen] = useState(false);
+  const [menuStyle, setMenuStyle] = useState<CSSProperties | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const selected = options.find((option) => option.value === value);
+  const empty = options.length === 0;
+
+  useEffect(() => {
+    if (empty) {
+      setOpen(false);
+    }
+  }, [empty]);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setMenuStyle(null);
+      return undefined;
+    }
+
+    function updateMenuPosition() {
+      const trigger = triggerRef.current;
+      if (!trigger) {
+        return;
+      }
+
+      const safeGap = 16;
+      const rect = trigger.getBoundingClientRect();
+      const boundaryRect =
+        rootRef.current
+          ?.closest<HTMLElement>("[data-select-boundary]")
+          ?.getBoundingClientRect() ?? null;
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const upperBoundary = Math.max(safeGap, boundaryRect?.top ?? safeGap);
+      const lowerBoundary = Math.min(
+        viewportHeight - safeGap,
+        boundaryRect ? boundaryRect.bottom - safeGap : viewportHeight - safeGap,
+      );
+      const estimatedHeight = Math.min(Math.max(options.length, 1) * 60 + 12, 272);
+      const spaceBelow = Math.max(0, lowerBoundary - rect.bottom);
+      const spaceAbove = Math.max(0, rect.top - upperBoundary);
+      const renderAbove = spaceBelow < Math.min(estimatedHeight, 176) && spaceAbove > spaceBelow;
+      const width = Math.min(rect.width, viewportWidth - safeGap * 2);
+      const left = Math.min(Math.max(rect.left, safeGap), viewportWidth - width - safeGap);
+      const maxHeight = Math.min(272, Math.max(0, (renderAbove ? spaceAbove : spaceBelow) - 8));
+      if (maxHeight <= 0) {
+        setMenuStyle(null);
+        return;
+      }
+      const top = renderAbove
+        ? Math.max(upperBoundary, rect.top - maxHeight - 8)
+        : Math.min(rect.bottom + 8, lowerBoundary - maxHeight);
+
+      setMenuStyle({
+        left,
+        maxHeight,
+        position: "fixed",
+        top,
+        width,
+        zIndex: 70,
+      });
+    }
+
+    updateMenuPosition();
+    window.addEventListener("resize", updateMenuPosition);
+    window.addEventListener("scroll", updateMenuPosition, true);
+    return () => {
+      window.removeEventListener("resize", updateMenuPosition);
+      window.removeEventListener("scroll", updateMenuPosition, true);
+    };
+  }, [open, options.length]);
 
   useEffect(() => {
     if (!open) {
@@ -260,7 +461,8 @@ function SelectMenu({
     }
 
     function handlePointerDown(event: PointerEvent) {
-      if (!rootRef.current?.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) {
         setOpen(false);
       }
     }
@@ -279,14 +481,15 @@ function SelectMenu({
     };
   }, [open]);
 
-  const empty = options.length === 0;
-
   return (
     <div className="relative" ref={rootRef}>
       <span className="text-sm font-medium">{label}</span>
       <button
+        aria-expanded={open}
+        aria-haspopup="listbox"
         className={optionTriggerClassName(open)}
         disabled={empty}
+        ref={triggerRef}
         onClick={() => setOpen((current) => !current)}
         type="button"
       >
@@ -301,38 +504,88 @@ function SelectMenu({
         />
       </button>
 
-      {open ? (
-        <div className="absolute z-30 mt-2 w-full overflow-hidden rounded-[24px] border border-border/70 bg-background/98 shadow-2xl backdrop-blur">
-          <div className="max-h-80 overflow-auto p-2">
-            {options.map((option) => {
-              const active = option.value === value;
-              return (
-                <button
-                  key={option.value}
-                  className={cn(
-                    "flex w-full items-start justify-between gap-3 rounded-2xl px-3 py-3 text-left transition-colors",
-                    active ? "bg-primary/10 text-foreground" : "hover:bg-foreground/5",
-                  )}
-                  onClick={() => {
-                    onChange(option.value);
-                    setOpen(false);
-                  }}
-                  type="button"
-                >
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium">{option.label}</p>
-                    {option.hint ? (
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">{option.hint}</p>
-                    ) : null}
-                  </div>
-                  {active ? <Check className="mt-0.5 size-4 shrink-0 text-primary" /> : null}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
+      {open && menuStyle && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="overflow-hidden rounded-[24px] border border-border/70 bg-background/98 shadow-[0_24px_80px_-24px_rgba(15,23,42,0.42)] backdrop-blur"
+              ref={menuRef}
+              role="listbox"
+              style={menuStyle}
+            >
+              <div className="overflow-auto p-2" style={{ maxHeight: menuStyle.maxHeight }}>
+                {options.map((option) => {
+                  const active = option.value === value;
+                  return (
+                    <button
+                      aria-selected={active}
+                      className={cn(
+                        "flex w-full cursor-pointer items-start justify-between gap-3 rounded-2xl px-3 py-2.5 text-left transition-colors",
+                        active ? "bg-primary/10 text-foreground" : "hover:bg-foreground/5",
+                      )}
+                      key={option.value}
+                      onClick={() => {
+                        onChange(option.value);
+                        setOpen(false);
+                      }}
+                      role="option"
+                      type="button"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium">{option.label}</p>
+                        {option.hint ? (
+                          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                            {option.hint}
+                          </p>
+                        ) : null}
+                      </div>
+                      {active ? <Check className="mt-0.5 size-4 shrink-0 text-primary" /> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
     </div>
+  );
+}
+
+function openExternalLink(url: string) {
+  void openExternalUrl(url);
+}
+
+function DeployRefreshingView() {
+  return (
+    <section className="space-y-6">
+      <Card className="overflow-hidden border-border/70">
+        <CardContent className="grid gap-0 p-0 xl:grid-cols-[1.15fr_0.85fr]">
+          <div className="border-b border-border/70 p-6 xl:border-b-0 xl:border-r">
+            <div className="flex flex-wrap items-center gap-3">
+              <Badge variant="info">OpenClaw · 一键部署</Badge>
+              <Badge variant="neutral">后台刷新中</Badge>
+            </div>
+            <h3 className="mt-4 text-3xl font-semibold tracking-tight">已进入部署页，正在读取本机配置</h3>
+            <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">
+              正在刷新 OpenClaw 安装状态、provider 列表和模型列表。结果出来后会在当前页面直接更新。
+            </p>
+          </div>
+
+          <div className="space-y-4 p-6">
+            <div className="rounded-[28px] border border-border/70 bg-foreground/5 p-5">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-sm text-muted-foreground">当前状态</p>
+                <LoaderCircle className="size-4 animate-spin text-primary" />
+              </div>
+              <p className="mt-2 text-2xl font-semibold">刷新中</p>
+              <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                首次进入页面时不再等扫描完成，后台刷新完成后会自动切到可操作状态。
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </section>
   );
 }
 
@@ -373,6 +626,65 @@ function getModel(
   return null;
 }
 
+function splitModelRef(modelRef: string) {
+  const separatorIndex = modelRef.indexOf("/");
+  if (separatorIndex <= 0 || separatorIndex >= modelRef.length - 1) {
+    return null;
+  }
+
+  return {
+    providerId: modelRef.slice(0, separatorIndex),
+    modelId: modelRef.slice(separatorIndex + 1),
+  };
+}
+
+function findTransitionModelForProviders(
+  catalog: OpenClawCatalog | null,
+  modelRef: string,
+  targetProviderIds: string[],
+) {
+  const parts = splitModelRef(modelRef);
+  if (parts) {
+    for (const targetProviderId of targetProviderIds) {
+      const exactMatch = getModel(catalog, `${targetProviderId}/${parts.modelId}`);
+      if (exactMatch) {
+        return exactMatch;
+      }
+    }
+  }
+
+  for (const targetProviderId of targetProviderIds) {
+    const provider = getProvider(catalog, targetProviderId);
+    if (provider?.models[0]) {
+      return { provider, model: provider.models[0] };
+    }
+  }
+
+  return null;
+}
+
+function resolveSelectionForAuthMode(
+  catalog: OpenClawCatalog | null,
+  selection: { provider: OpenClawProviderCatalog; model: OpenClawProviderModel } | null,
+  authMode: DeployAuthMode,
+) {
+  if (!selection) {
+    return null;
+  }
+
+  const transitions = providerLoginTransitions[selection.provider.id];
+
+  if (authMode === "login" && transitions?.login?.length) {
+    return findTransitionModelForProviders(catalog, selection.model.ref, transitions.login) ?? selection;
+  }
+
+  if (authMode === "api" && transitions?.api?.length) {
+    return findTransitionModelForProviders(catalog, selection.model.ref, transitions.api) ?? selection;
+  }
+
+  return selection;
+}
+
 function preferredProviderIds(planId: PlanId) {
   return plans.find((plan) => plan.id === planId)?.preferredProviders ?? [];
 }
@@ -407,6 +719,18 @@ function pickInitialModel(provider: OpenClawProviderCatalog | null, planId: Plan
   return provider.models[0];
 }
 
+function buildProviderRouteOptions(providerId: string) {
+  return providerRouteOptionsByProvider[providerId] ?? [];
+}
+
+function defaultProviderRouteId(providerId: string) {
+  return buildProviderRouteOptions(providerId)[0]?.value ?? "";
+}
+
+function resolveProviderRouteLabel(providerId: string, routeId: string) {
+  return buildProviderRouteOptions(providerId).find((option) => option.value === routeId)?.label ?? "默认";
+}
+
 function buildProviderOptions(catalog: OpenClawCatalog | null) {
   return (catalog?.providers ?? []).map((provider) => ({
     value: provider.id,
@@ -424,7 +748,9 @@ function buildModelOptions(provider: OpenClawProviderCatalog | null) {
 }
 
 function buildPreview(config: DeployConfig, catalog: OpenClawCatalog | null) {
-  const primary = getModel(catalog, config.primaryModelRef);
+  const primary =
+    resolveSelectionForAuthMode(catalog, getModel(catalog, config.primaryModelRef), config.authMode) ??
+    getModel(catalog, config.primaryModelRef);
   const fallback = config.fallbackEnabled ? getModel(catalog, config.fallbackModelRef) : null;
   const providerInsight = primary ? getProviderInsight(primary.provider.id) : null;
 
@@ -438,10 +764,7 @@ function buildPreview(config: DeployConfig, catalog: OpenClawCatalog | null) {
     agents: {
       defaults: {
         model: {
-          primary:
-            config.authMode === "login" && primary?.model.supportsLogin
-              ? `${primary.provider.id}-oauth/${primary.model.title}`
-              : config.primaryModelRef,
+          primary: primary?.model.ref ?? config.primaryModelRef,
           fallbacks: fallback ? [fallback.model.ref] : [],
         },
       },
@@ -449,6 +772,7 @@ function buildPreview(config: DeployConfig, catalog: OpenClawCatalog | null) {
     extras: {
       desktopShortcut: config.createDesktopShortcut,
       exampleRecipe: config.writeExampleRecipe,
+      providerRoute: config.primaryProviderRouteId || undefined,
     },
   };
 
@@ -475,47 +799,6 @@ function previewExcerpt(payload: string, lines = 7) {
   }
 
   return `${segments.slice(0, lines).join("\n")}\n...`;
-}
-
-function buildStagePlan(config: DeployConfig, catalog: OpenClawCatalog | null): DeployStage[] {
-  const primary = getModel(catalog, config.primaryModelRef);
-  const primaryProvider = primary ? getProviderInsight(primary.provider.id) : null;
-  const fallback = config.fallbackEnabled ? getModel(catalog, config.fallbackModelRef) : null;
-
-  return [
-    {
-      id: "credential",
-      title: "准备主模型凭据",
-      detail:
-        config.authMode === "login" && primaryProvider?.oauthCommand
-          ? `准备执行 ${primaryProvider.oauthCommand}`
-          : `准备写入 ${primaryProvider?.apiEnv ?? "API Key"} 并校验 ${config.primaryModelRef}`,
-    },
-    {
-      id: "install",
-      title: "初始化运行目录",
-      detail: `在 ${config.installDir} 准备 OpenClaw 工作区 ${config.workspaceDir}`,
-    },
-    {
-      id: "primary",
-      title: "写入主模型配置",
-      detail: `把主模型设置为 ${config.primaryModelRef}`,
-    },
-    {
-      id: "fallback",
-      title: "处理回退模型",
-      detail: fallback ? `追加回退模型 ${fallback.model.ref}` : "当前不启用回退模型",
-    },
-    {
-      id: "verify",
-      title: "验证启动结果",
-      detail: "检查 Gateway 与 provider 凭据，确认部署配置可以正常启动。",
-    },
-  ];
-}
-
-function openExternalLink(url: string) {
-  window.open(url, "_blank", "noopener,noreferrer");
 }
 
 function InstallOpenClawView({
@@ -675,10 +958,11 @@ export function DeployPage() {
   const [config, setConfig] = useState<DeployConfig>(() => buildPlanConfig("quickstart"));
   const [configModalOpen, setConfigModalOpen] = useState(false);
   const [loginStatus, setLoginStatus] = useState<LoginStatus>("idle");
+  const [loginLaunching, setLoginLaunching] = useState(false);
+  const [loginChecking, setLoginChecking] = useState(false);
   const [running, setRunning] = useState(false);
-  const [activeStageIndex, setActiveStageIndex] = useState(-1);
+  const [deployApplied, setDeployApplied] = useState(false);
   const [lastSummary, setLastSummary] = useState<string | null>(null);
-  const loginTimerRef = useRef<number | null>(null);
 
   async function refreshCatalog(nextMessage?: string) {
     setError(null);
@@ -703,53 +987,55 @@ export function DeployPage() {
   }, []);
 
   useEffect(() => {
-    return () => {
-      if (loginTimerRef.current !== null) {
-        window.clearTimeout(loginTimerRef.current);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
     if (!catalog?.installed || catalog.providers.length === 0) {
       return;
     }
 
-    const preferredProvider =
+    const selectedProvider =
       getProvider(catalog, config.primaryProviderId) ?? pickInitialProvider(catalog, config.planId);
-    if (!preferredProvider) {
+    if (!selectedProvider) {
       return;
     }
 
-    const preferredModel =
-      preferredProvider.models.find((item) => item.ref === config.primaryModelRef) ??
-      pickInitialModel(preferredProvider, config.planId);
-    if (!preferredModel) {
+    const selectedModel =
+      selectedProvider.models.find((item) => item.ref === config.primaryModelRef) ??
+      pickInitialModel(selectedProvider, config.planId);
+    if (!selectedModel) {
       return;
     }
 
-    const nextAuthMode = preferredModel.authModes.includes(config.authMode)
+    const resolvedPrimary =
+      resolveSelectionForAuthMode(catalog, { provider: selectedProvider, model: selectedModel }, config.authMode) ??
+      { provider: selectedProvider, model: selectedModel };
+    const nextAuthMode = resolvedPrimary.model.authModes.includes(config.authMode)
       ? config.authMode
-      : preferredModel.authModes[0];
-    const nextFallbackProviderId = config.fallbackProviderId || preferredProvider.id;
+      : resolvedPrimary.model.authModes[0];
+    const nextPrimaryRouteId = buildProviderRouteOptions(resolvedPrimary.provider.id).some(
+      (option) => option.value === config.primaryProviderRouteId,
+    )
+      ? config.primaryProviderRouteId
+      : defaultProviderRouteId(resolvedPrimary.provider.id);
+    const nextFallbackProviderId = config.fallbackProviderId || resolvedPrimary.provider.id;
     const nextFallbackModel = config.fallbackEnabled
       ? getProvider(catalog, nextFallbackProviderId)?.models.find(
-          (item) => item.ref === config.fallbackModelRef && item.ref !== preferredModel.ref,
+          (item) => item.ref === config.fallbackModelRef && item.ref !== resolvedPrimary.model.ref,
         ) ??
-        getProvider(catalog, nextFallbackProviderId)?.models.find((item) => item.ref !== preferredModel.ref) ??
+        getProvider(catalog, nextFallbackProviderId)?.models.find((item) => item.ref !== resolvedPrimary.model.ref) ??
         null
       : null;
 
     if (
-      config.primaryProviderId !== preferredProvider.id ||
-      config.primaryModelRef !== preferredModel.ref ||
+      config.primaryProviderId !== resolvedPrimary.provider.id ||
+      config.primaryProviderRouteId !== nextPrimaryRouteId ||
+      config.primaryModelRef !== resolvedPrimary.model.ref ||
       config.authMode !== nextAuthMode ||
       (config.fallbackEnabled && config.fallbackModelRef !== (nextFallbackModel?.ref ?? ""))
     ) {
       setConfig((current) => ({
         ...current,
-        primaryProviderId: preferredProvider.id,
-        primaryModelRef: preferredModel.ref,
+        primaryProviderId: resolvedPrimary.provider.id,
+        primaryProviderRouteId: nextPrimaryRouteId,
+        primaryModelRef: resolvedPrimary.model.ref,
         authMode: nextAuthMode,
         fallbackProviderId: nextFallbackProviderId,
         fallbackModelRef: nextFallbackModel?.ref ?? "",
@@ -764,13 +1050,28 @@ export function DeployPage() {
     config.planId,
     config.primaryModelRef,
     config.primaryProviderId,
+    config.primaryProviderRouteId,
   ]);
 
   const activePlan = plans.find((plan) => plan.id === config.planId) ?? plans[0];
-  const primaryProvider = getProvider(catalog, config.primaryProviderId);
-  const primaryModel = getModel(catalog, config.primaryModelRef)?.model ?? null;
-  const primaryInsight = getProviderInsight(config.primaryProviderId);
+  const effectivePrimary =
+    resolveSelectionForAuthMode(catalog, getModel(catalog, config.primaryModelRef), config.authMode) ??
+    getModel(catalog, config.primaryModelRef);
+  const loginPrimary =
+    resolveSelectionForAuthMode(catalog, getModel(catalog, config.primaryModelRef), "login") ??
+    null;
+  const supportsProviderLogin = Boolean(loginPrimary?.model.authModes.includes("login"));
+  const primaryProvider = effectivePrimary?.provider ?? getProvider(catalog, config.primaryProviderId);
+  const primaryModel = effectivePrimary?.model ?? null;
+  const primaryInsight = getProviderInsight(primaryProvider?.id ?? config.primaryProviderId);
+  const loginInsight = getProviderInsight(loginPrimary?.provider.id ?? "");
+  const loginActionLabel = loginInsight.oauthLabel ?? "登录";
   const primaryProviderOptions = buildProviderOptions(catalog);
+  const primaryRouteOptions = buildProviderRouteOptions(primaryProvider?.id ?? config.primaryProviderId);
+  const primaryRouteLabel = resolveProviderRouteLabel(
+    primaryProvider?.id ?? config.primaryProviderId,
+    config.primaryProviderRouteId,
+  );
   const primaryModelOptions = buildModelOptions(primaryProvider);
   const fallbackProvider = getProvider(catalog, config.fallbackProviderId);
   const fallbackProviderOptions = buildProviderOptions(catalog);
@@ -778,42 +1079,16 @@ export function DeployPage() {
     (item) => item.value !== config.primaryModelRef,
   );
   const preview = buildPreview(config, catalog);
-  const stagePlan = buildStagePlan(config, catalog);
-  const progressValue = running
-    ? ((Math.max(activeStageIndex, 0) + 0.35) / stagePlan.length) * 100
-    : activeStageIndex >= stagePlan.length
-      ? 100
-      : 0;
+  const progressValue = running ? 72 : deployApplied ? 100 : 0;
   const credentialReady =
     config.authMode === "api" ? config.apiSecret.trim().length > 0 : loginStatus === "connected";
-  const canStart = catalog?.installed && credentialReady && !running && Boolean(config.primaryModelRef);
-
-  useEffect(() => {
-    if (!running) {
-      return undefined;
-    }
-
-    if (activeStageIndex < 0 || activeStageIndex >= stagePlan.length) {
-      return undefined;
-    }
-
-    const currentStage = stagePlan[activeStageIndex];
-    const timeout = window.setTimeout(() => {
-      if (activeStageIndex + 1 >= stagePlan.length) {
-        setLastSummary(
-          `部署演示完成。主模型将写入 ${config.primaryModelRef}，运行目录为 ${config.installDir}。`,
-        );
-        setActiveStageIndex(stagePlan.length);
-        setRunning(false);
-        return;
-      }
-
-      setLastSummary(`${currentStage.title} 已完成。`);
-      setActiveStageIndex((current) => current + 1);
-    }, activeStageIndex === 0 ? 650 : 900);
-
-    return () => window.clearTimeout(timeout);
-  }, [activeStageIndex, config.installDir, config.primaryModelRef, running, stagePlan]);
+  const canStart =
+    catalog?.installed &&
+    credentialReady &&
+    !running &&
+    !loginLaunching &&
+    !loginChecking &&
+    Boolean(config.primaryModelRef);
 
   async function handleInstallOpenClaw() {
     setInstallingOpenClaw(true);
@@ -858,15 +1133,24 @@ export function DeployPage() {
   }
 
   function applyPlan(planId: PlanId) {
-    setConfig((current) => ({ ...buildPlanConfig(planId), installDir: current.installDir, workspaceDir: current.workspaceDir }));
+    setConfig((current) => ({
+      ...buildPlanConfig(planId),
+      installDir: current.installDir,
+      workspaceDir: current.workspaceDir,
+    }));
     setLoginStatus("idle");
     setRunning(false);
-    setActiveStageIndex(-1);
+    setDeployApplied(false);
     setLastSummary(`已切换到 ${plans.find((plan) => plan.id === planId)?.title ?? planId}。`);
   }
 
   function updateConfig(patch: Partial<DeployConfig>) {
-    setConfig((current) => ({ ...current, ...patch }));
+    setDeployApplied(false);
+    setConfig((current) => ({
+      ...current,
+      ...patch,
+      planId: "planId" in patch ? (patch.planId ?? current.planId) : "custom",
+    }));
   }
 
   function changePrimaryProvider(providerId: string) {
@@ -876,15 +1160,23 @@ export function DeployPage() {
       return;
     }
 
+    const resolvedPrimary =
+      resolveSelectionForAuthMode(catalog, { provider: nextProvider, model: nextModel }, config.authMode) ??
+      { provider: nextProvider, model: nextModel };
+    const nextAuthMode = resolvedPrimary.model.authModes.includes(config.authMode)
+      ? config.authMode
+      : resolvedPrimary.model.authModes[0];
+
     updateConfig({
-      primaryProviderId: nextProvider.id,
-      primaryModelRef: nextModel.ref,
-      authMode: nextModel.authModes.includes(config.authMode) ? config.authMode : nextModel.authModes[0],
+      primaryProviderId: resolvedPrimary.provider.id,
+      primaryProviderRouteId: defaultProviderRouteId(resolvedPrimary.provider.id),
+      primaryModelRef: resolvedPrimary.model.ref,
+      authMode: nextAuthMode,
       apiSecret: "",
-      fallbackModelRef: config.fallbackModelRef === nextModel.ref ? "" : config.fallbackModelRef,
+      fallbackModelRef: config.fallbackModelRef === resolvedPrimary.model.ref ? "" : config.fallbackModelRef,
     });
-    setLoginStatus("idle");
-    setLastSummary(`主模型公司已切到 ${nextProvider.title}。`);
+    setLoginStatus(nextAuthMode === "login" ? loginStatus : "idle");
+    setLastSummary(`主模型公司已切到 ${resolvedPrimary.provider.title}。`);
   }
 
   function changePrimaryModel(modelRef: string) {
@@ -893,40 +1185,106 @@ export function DeployPage() {
       return;
     }
 
+    const resolvedPrimary =
+      resolveSelectionForAuthMode(catalog, next, config.authMode) ??
+      next;
+    const nextAuthMode = resolvedPrimary.model.authModes.includes(config.authMode)
+      ? config.authMode
+      : resolvedPrimary.model.authModes[0];
+
     updateConfig({
-      primaryProviderId: next.provider.id,
-      primaryModelRef: next.model.ref,
-      authMode: next.model.authModes.includes(config.authMode) ? config.authMode : next.model.authModes[0],
+      primaryProviderId: resolvedPrimary.provider.id,
+      primaryProviderRouteId: buildProviderRouteOptions(resolvedPrimary.provider.id).some(
+        (option) => option.value === config.primaryProviderRouteId,
+      )
+        ? config.primaryProviderRouteId
+        : defaultProviderRouteId(resolvedPrimary.provider.id),
+      primaryModelRef: resolvedPrimary.model.ref,
+      authMode: nextAuthMode,
       apiSecret: "",
-      fallbackModelRef: config.fallbackModelRef === next.model.ref ? "" : config.fallbackModelRef,
+      fallbackModelRef: config.fallbackModelRef === resolvedPrimary.model.ref ? "" : config.fallbackModelRef,
     });
-    setLoginStatus("idle");
-    setLastSummary(`主模型已切到 ${next.model.ref}。`);
+    setLoginStatus(nextAuthMode === "login" ? loginStatus : "idle");
+    setLastSummary(`主模型已切到 ${resolvedPrimary.model.ref}。`);
   }
 
   function setAuthMode(mode: DeployAuthMode) {
-    updateConfig({ authMode: mode, apiSecret: "" });
+    const resolvedPrimary =
+      resolveSelectionForAuthMode(catalog, getModel(catalog, config.primaryModelRef), mode) ??
+      getModel(catalog, config.primaryModelRef);
+    const nextAuthMode = resolvedPrimary?.model.authModes.includes(mode)
+      ? mode
+      : resolvedPrimary?.model.authModes[0] ?? "api";
+
+    updateConfig({
+      authMode: nextAuthMode,
+      apiSecret: "",
+      primaryProviderId: resolvedPrimary?.provider.id ?? config.primaryProviderId,
+      primaryProviderRouteId: resolvedPrimary?.provider
+        ? buildProviderRouteOptions(resolvedPrimary.provider.id).some(
+            (option) => option.value === config.primaryProviderRouteId,
+          )
+          ? config.primaryProviderRouteId
+          : defaultProviderRouteId(resolvedPrimary.provider.id)
+        : config.primaryProviderRouteId,
+      primaryModelRef: resolvedPrimary?.model.ref ?? config.primaryModelRef,
+    });
     setLoginStatus("idle");
-    setLastSummary(mode === "login" ? "已切换到 OAuth 登录。" : "已切换到 API Key。");
+    setLastSummary(
+      nextAuthMode === "login"
+        ? `已切换到 ${loginActionLabel}${resolvedPrimary ? `，主模型改为 ${resolvedPrimary.model.ref}` : ""}。`
+        : mode === "login"
+          ? "当前模型不支持登录授权，已保留 API Key 模式。"
+          : "已切换到 API Key。",
+    );
   }
 
-  function startLoginFlow() {
-    if (!primaryModel?.supportsLogin || config.authMode !== "login" || running) {
+  function changePrimaryProviderRoute(routeId: string) {
+    updateConfig({ primaryProviderRouteId: routeId });
+    setLastSummary(`当前接入路线已切到 ${resolveProviderRouteLabel(config.primaryProviderId, routeId)}。`);
+  }
+
+  async function startLoginFlow() {
+    if (!primaryModel?.supportsLogin || config.authMode !== "login" || running || loginLaunching) {
       return;
     }
 
-    if (loginTimerRef.current !== null) {
-      window.clearTimeout(loginTimerRef.current);
+    setLoginLaunching(true);
+    setError(null);
+
+    try {
+      const result = await launchOpenClawAuth(primaryProvider?.id ?? config.primaryProviderId);
+      setLoginStatus("running");
+      setLastSummary(result.message);
+    } catch (loginError) {
+      setLoginStatus("idle");
+      setError(
+        loginError instanceof Error ? loginError.message : `拉起${loginActionLabel}失败，请稍后重试。`,
+      );
+    } finally {
+      setLoginLaunching(false);
+    }
+  }
+
+  async function verifyLoginFlow() {
+    if (config.authMode !== "login" || loginChecking) {
+      return;
     }
 
-    setLoginStatus("running");
-    setLastSummary("正在执行 OAuth 登录演示。真实接入时会先拉起命令行，再跳转网页登录页。");
+    setLoginChecking(true);
+    setError(null);
 
-    loginTimerRef.current = window.setTimeout(() => {
-      setLoginStatus("connected");
-      setLastSummary("OAuth 登录演示已完成，当前状态标记为已连接。");
-      loginTimerRef.current = null;
-    }, 1200);
+    try {
+      const result = await checkOpenClawAuth(primaryProvider?.id ?? config.primaryProviderId);
+      setLoginStatus(result.connected ? "connected" : "running");
+      setLastSummary(result.message);
+    } catch (loginError) {
+      setError(
+        loginError instanceof Error ? loginError.message : `检查${loginActionLabel}状态失败，请稍后重试。`,
+      );
+    } finally {
+      setLoginChecking(false);
+    }
   }
 
   function toggleFallback(enabled: boolean) {
@@ -959,36 +1317,41 @@ export function DeployPage() {
     });
   }
 
-  function startDeployment() {
-    if (!canStart) {
+  async function startDeployment() {
+    if (!canStart || running) {
       return;
     }
 
     setRunning(true);
-    setActiveStageIndex(0);
-    setLastSummary(`准备开始 ${activePlan.title} 部署。`);
-  }
+    setDeployApplied(false);
+    setError(null);
+    setLastSummary(`正在应用 ${activePlan.title} 配置…`);
 
-  function resetDemo() {
-    setRunning(false);
-    setActiveStageIndex(-1);
-    setLoginStatus("idle");
-    setConfigModalOpen(false);
-    setLastSummary(null);
+    try {
+      const deployPrimary = effectivePrimary ?? getModel(catalog, config.primaryModelRef);
+      const result = await applyOpenClawDeploy({
+        primaryProviderId: deployPrimary?.provider.id ?? config.primaryProviderId,
+        primaryProviderRouteId: config.primaryProviderRouteId,
+        primaryModelRef: deployPrimary?.model.ref ?? config.primaryModelRef,
+        authMode: config.authMode,
+        apiSecret: config.apiSecret,
+        fallbackModelRef: config.fallbackEnabled ? config.fallbackModelRef : "",
+        autoStartGateway: config.autoStartGateway,
+      });
+      setDeployApplied(result.applied);
+      setLastSummary(result.message);
+      await refreshCatalog(result.message);
+    } catch (deployError) {
+      setError(
+        deployError instanceof Error ? deployError.message : "应用部署配置失败，请稍后重试。",
+      );
+    } finally {
+      setRunning(false);
+    }
   }
 
   if (catalogState === "loading" && !catalog) {
-    return (
-      <section className="space-y-6">
-        <Card className="border-border/70">
-          <CardContent className="space-y-4 p-6">
-            <div className="h-5 w-24 animate-pulse rounded-full bg-foreground/10" />
-            <div className="h-10 w-72 animate-pulse rounded-full bg-foreground/8" />
-            <div className="h-24 animate-pulse rounded-[28px] bg-foreground/8" />
-          </CardContent>
-        </Card>
-      </section>
-    );
+    return <DeployRefreshingView />;
   }
 
   if (!catalog?.installed) {
@@ -997,7 +1360,7 @@ export function DeployPage() {
         catalog={catalog}
         error={error}
         installing={installingOpenClaw}
-        loading={catalogState === "loading"}
+        refreshing={catalogState === "loading"}
         manualScanPath={manualScanPath}
         message={statusMessage}
         savingScanPath={savingScanPath}
@@ -1021,33 +1384,42 @@ export function DeployPage() {
       <Card className="overflow-hidden border-border/70">
         <CardContent className="grid gap-0 p-0 xl:grid-cols-[1.2fr_0.85fr]">
           <div className="border-b border-border/70 p-6 xl:border-b-0 xl:border-r">
-            <Badge variant="info">OpenClaw · 一键部署</Badge>
+            <div className="flex flex-wrap items-center gap-3">
+              <Badge variant="info">OpenClaw · 一键部署</Badge>
+              {catalogState === "loading" ? <Badge variant="neutral">后台刷新中</Badge> : null}
+            </div>
             <h3 className="mt-4 text-3xl font-semibold tracking-tight">OpenClaw 已就绪，现在开始选部署策略</h3>
-            <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">
-              当前 provider 和模型列表已经改成从 OpenClaw CLI 动态读取。下拉菜单不再使用原生控件，也不再在右侧塞标签。
-            </p>
-
             <div className="mt-6 flex flex-wrap gap-3">
-              <Button disabled={!canStart} onClick={startDeployment}>
+              <Button
+                disabled={!canStart}
+                onClick={() => {
+                  void startDeployment();
+                }}
+              >
                 {running ? <LoaderCircle className="size-4 animate-spin" /> : <Play className="size-4" />}
-                {running ? "部署进行中" : "开始一键部署"}
+                {running ? "部署应用中" : "开始一键部署"}
               </Button>
               <Button
+                disabled={catalogState === "loading"}
                 onClick={() => {
                   void refreshCatalog("已重新读取 OpenClaw 可用模型列表。");
                 }}
                 variant="outline"
               >
-                <RefreshCw className="size-4" />
-                刷新模型列表
-              </Button>
-              <Button onClick={resetDemo} variant="ghost">
-                <RefreshCw className="size-4" />
-                重置演示
+                {catalogState === "loading" ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="size-4" />
+                )}
+                {catalogState === "loading" ? "刷新中" : "刷新模型列表"}
               </Button>
             </div>
 
-            <div className="mt-6 grid gap-4 md:grid-cols-2">
+            <p className="mt-6 text-sm text-muted-foreground">
+              默认从“快速体验”开始；只要你手动改下面的配置，策略会自动切到右侧“自定义”。
+            </p>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
               {plans.map((plan) => (
                 <button
                   key={plan.id}
@@ -1064,8 +1436,6 @@ export function DeployPage() {
                     <p className="text-lg font-semibold">{plan.title}</p>
                     <Badge variant={plan.tone}>{plan.badge}</Badge>
                   </div>
-                  <p className="mt-3 text-sm leading-6 text-muted-foreground">{plan.summary}</p>
-                  <p className="mt-3 text-sm leading-6 text-muted-foreground">{plan.detail}</p>
                 </button>
               ))}
             </div>
@@ -1095,7 +1465,7 @@ export function DeployPage() {
                     授权方式
                   </div>
                   <p className="mt-3 text-lg font-semibold">
-                    {config.authMode === "login" ? "OAuth 登录" : "API Key"}
+                    {config.authMode === "login" ? loginActionLabel : "API Key"}
                   </p>
                 </div>
                 <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
@@ -1128,22 +1498,10 @@ export function DeployPage() {
               <p className="mt-4 text-sm leading-6 text-muted-foreground">
                 {lastSummary ??
                   statusMessage ??
-                  "完成主模型和授权配置后，开始按钮才会解锁。选 OAuth 登录时，需要先点一次登录按钮。"}
+                  `完成主模型和授权配置后，开始按钮才会解锁。选 ${loginActionLabel} 时，需要先点一次登录按钮。`}
               </p>
             </div>
 
-            <div className="rounded-[28px] border border-border/70 bg-background/80 p-5">
-              <div className="flex items-center justify-between gap-3">
-                <p className="text-sm font-medium">配置预览</p>
-                <Button onClick={() => setConfigModalOpen(true)} size="sm" variant="outline">
-                  <Expand className="size-4" />
-                  显示全部
-                </Button>
-              </div>
-              <pre className="mt-3 overflow-x-auto rounded-2xl bg-foreground/6 p-4 font-mono text-xs leading-6 text-muted-foreground">
-                {previewExcerpt(preview)}
-              </pre>
-            </div>
           </div>
         </CardContent>
       </Card>
@@ -1154,21 +1512,33 @@ export function DeployPage() {
         </div>
       ) : null}
 
-      <div className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
-        <div className="space-y-6">
+      <div className="space-y-6">
+        <div className="min-w-0 space-y-6">
           <Card className="border-border/70">
-            <CardHeader>
+            <CardHeader className="gap-0 pb-3">
               <CardTitle>主模型</CardTitle>
-              <CardDescription>公司和模型都直接来自 `openclaw models list`，而不是前端硬编码枚举。</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-6">
-              <div className="grid gap-4 md:grid-cols-2">
+            <CardContent className="space-y-5 pt-0" data-select-boundary>
+              <div
+                className={cn(
+                  "grid gap-4",
+                  primaryRouteOptions.length > 0 ? "md:grid-cols-3" : "md:grid-cols-2",
+                )}
+              >
                 <SelectMenu
                   label="模型公司"
                   onChange={changePrimaryProvider}
                   options={primaryProviderOptions}
                   value={config.primaryProviderId}
                 />
+                {primaryRouteOptions.length > 0 ? (
+                  <SelectMenu
+                    label="接入路线"
+                    onChange={changePrimaryProviderRoute}
+                    options={primaryRouteOptions}
+                    value={config.primaryProviderRouteId}
+                  />
+                ) : null}
                 <SelectMenu
                   label="主模型"
                   onChange={changePrimaryModel}
@@ -1184,6 +1554,11 @@ export function DeployPage() {
                     {primaryProvider?.title ?? primaryInsight.title}
                   </div>
                   <p className="mt-3 text-sm leading-6 text-muted-foreground">{primaryInsight.summary}</p>
+                  {primaryRouteOptions.length > 0 ? (
+                    <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                      当前接入路线：<span className="font-medium text-foreground">{primaryRouteLabel}</span>
+                    </p>
+                  ) : null}
                   <p className="mt-3 font-mono text-xs text-muted-foreground">{config.primaryModelRef}</p>
                   <p className="mt-3 text-sm leading-6 text-muted-foreground">
                     {primaryModel?.title ?? "当前 provider 尚未返回模型详情。"}
@@ -1211,25 +1586,27 @@ export function DeployPage() {
             <CardHeader>
               <CardTitle>授权方式</CardTitle>
               <CardDescription>
-                只有 OpenClaw 返回支持登录的模型时，才会出现 `OAuth 登录` 按钮。否则固定使用 API Key。
+                当前模型如果存在可用的登录入口，会在这里显示对应的真实登录方式；同一供应商的 API / OAuth / setup-token 会自动切到正确 provider。
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-5">
-              <div className="flex flex-wrap gap-3">
+            <CardContent className="min-w-0 space-y-5">
+              <div className="grid gap-3 sm:grid-cols-2">
                 <Button
+                  className="w-full justify-center whitespace-nowrap"
                   onClick={() => setAuthMode("api")}
                   variant={config.authMode === "api" ? "default" : "outline"}
                 >
                   <KeyRound className="size-4" />
                   API Key
                 </Button>
-                {primaryModel?.supportsLogin ? (
+                {supportsProviderLogin ? (
                   <Button
+                    className="w-full justify-center whitespace-nowrap"
                     onClick={() => setAuthMode("login")}
                     variant={config.authMode === "login" ? "default" : "outline"}
                   >
                     <LockOpen className="size-4" />
-                    OAuth 登录
+                    {loginActionLabel}
                   </Button>
                 ) : null}
               </div>
@@ -1248,24 +1625,46 @@ export function DeployPage() {
                   />
                 </div>
               ) : (
-                <div className="rounded-[24px] border border-border/70 bg-foreground/5 p-5">
-                  <p className="text-sm font-medium">OAuth 登录已替代 API Key 输入框</p>
+                <div className="min-w-0 rounded-[24px] border border-border/70 bg-foreground/5 p-5">
+                  <p className="text-sm font-medium">{loginActionLabel} 已替代 API Key 输入框</p>
                   <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                    真实接入时，这里会先拉起命令行，再跳转网页授权，完成后回到应用里继续写入 OpenClaw 配置。
+                    现在会真实拉起 OpenClaw 的授权命令。浏览器或终端流程完成后，回到这里点一次“检查授权状态”。
                   </p>
-                  <div className="mt-4 rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-xs leading-6 text-muted-foreground">
+                  <div className="mt-4 overflow-x-auto rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-xs leading-6 text-muted-foreground break-all whitespace-pre-wrap">
                     {primaryInsight.oauthCommand}
                   </div>
-                  <div className="mt-4 flex flex-wrap items-center gap-3">
-                    <Button disabled={loginStatus === "running"} onClick={startLoginFlow}>
-                      {loginStatus === "running" ? (
+                  <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] lg:items-center">
+                    <Button
+                      className="w-full justify-center whitespace-nowrap lg:min-w-[176px]"
+                      disabled={loginLaunching}
+                      onClick={() => {
+                        void startLoginFlow();
+                      }}
+                    >
+                      {loginLaunching ? (
                         <LoaderCircle className="size-4 animate-spin" />
                       ) : (
                         <TerminalSquare className="size-4" />
                       )}
-                      {loginStatus === "connected" ? "已完成 OAuth 登录" : "开始 OAuth 登录"}
+                      {loginStatus === "connected" ? `重新拉起${loginActionLabel}` : `开始${loginActionLabel}`}
+                    </Button>
+                    <Button
+                      className="w-full justify-center whitespace-nowrap lg:min-w-[176px]"
+                      disabled={loginLaunching || loginChecking}
+                      onClick={() => {
+                        void verifyLoginFlow();
+                      }}
+                      variant="outline"
+                    >
+                      {loginChecking ? (
+                        <LoaderCircle className="size-4 animate-spin" />
+                      ) : (
+                        <RefreshCw className="size-4" />
+                      )}
+                      检查授权状态
                     </Button>
                     <Badge
+                      className="justify-self-start"
                       variant={
                         loginStatus === "connected"
                           ? "success"
@@ -1296,7 +1695,7 @@ export function DeployPage() {
               <CardTitle>回退模型与部署选项</CardTitle>
               <CardDescription>回退模型默认关闭，启用后再展开选择器。</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-6">
+            <CardContent className="space-y-6" data-select-boundary>
               <div className="flex flex-wrap gap-3">
                 <Button
                   onClick={() => toggleFallback(false)}
@@ -1410,79 +1809,25 @@ export function DeployPage() {
           </Card>
         </div>
 
-        <div className="space-y-6">
-          <Card className="border-border/70">
-            <CardHeader>
-              <CardTitle>阶段时间线</CardTitle>
-              <CardDescription>日志模块已经移除，只保留部署阶段和当前状态。</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {stagePlan.map((stage, index) => {
-                const status =
-                  activeStageIndex > index
-                    ? "done"
-                    : activeStageIndex === index && running
-                      ? "active"
-                      : activeStageIndex >= stagePlan.length
-                        ? "done"
-                        : "pending";
-
-                return (
-                  <div
-                    key={stage.id}
-                    className={cn(
-                      "rounded-2xl border px-4 py-4 transition-colors",
-                      status === "done"
-                        ? "border-success/20 bg-success/8"
-                        : status === "active"
-                          ? "border-primary/20 bg-primary/8"
-                          : "border-border/70 bg-background/40",
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-sm font-semibold">
-                        {String(index + 1).padStart(2, "0")} · {stage.title}
-                      </p>
-                      <Badge
-                        variant={
-                          status === "done" ? "success" : status === "active" ? "info" : "neutral"
-                        }
-                      >
-                        {status === "done" ? "完成" : status === "active" ? "进行中" : "等待中"}
-                      </Badge>
-                    </div>
-                    <p className="mt-2 text-sm leading-6 text-muted-foreground">{stage.detail}</p>
-                  </div>
-                );
-              })}
-            </CardContent>
-          </Card>
-
-          <Card className="border-border/70">
-            <CardHeader>
-              <CardTitle>方案解读</CardTitle>
-              <CardDescription>这一版把流程顺序彻底改成“先装 OpenClaw，再部署”。</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3 text-sm leading-6 text-muted-foreground">
-              <div className="flex items-start gap-3 rounded-2xl border border-border/70 px-4 py-3">
-                <PackagePlus className="mt-0.5 size-4 text-success" />
-                <p>安装前只显示 OpenClaw 安装页，避免用户在缺少 CLI 的情况下误选模型。</p>
+        <Card className="border-border/70">
+          <CardHeader className="pb-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <CardTitle>配置预览</CardTitle>
+                <CardDescription>固定高度显示，完整配置通过右上角按钮展开。</CardDescription>
               </div>
-              <div className="flex items-start gap-3 rounded-2xl border border-border/70 px-4 py-3">
-                <Sparkles className="mt-0.5 size-4 text-primary" />
-                <p>模型公司和模型列表都改成通过 `openclaw models list --all --json` 动态读取。</p>
-              </div>
-              <div className="flex items-start gap-3 rounded-2xl border border-border/70 px-4 py-3">
-                <LockOpen className="mt-0.5 size-4 text-primary" />
-                <p>只有 CLI 返回支持登录的模型时，页面才会显示 `OAuth 登录` 按钮。</p>
-              </div>
-              <div className="flex items-start gap-3 rounded-2xl border border-border/70 px-4 py-3">
-                <ShieldCheck className="mt-0.5 size-4 text-primary" />
-                <p>下拉菜单已经完全去掉右侧标签，视觉上只保留名称、说明和选中状态。</p>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+              <Button onClick={() => setConfigModalOpen(true)} size="sm" variant="outline">
+                <Expand className="size-4" />
+                显示全部
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <pre className="h-[320px] overflow-auto rounded-[24px] bg-foreground/6 p-4 font-mono text-xs leading-6 text-muted-foreground">
+              {preview}
+            </pre>
+          </CardContent>
+        </Card>
       </div>
 
       {configModalOpen ? (

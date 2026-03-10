@@ -1,9 +1,10 @@
 import {
   Activity,
-  BookTemplate,
   Box,
   ChevronRight,
+  Power,
   Settings2,
+  Store,
   Sparkles,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -12,14 +13,15 @@ import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { ModeToggle } from "@/components/app/mode-toggle";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
-import { fetchOpenClawCatalog, isTauriRuntime, scanEnvironment } from "@/lib/tauri";
-import type { EnvironmentScan, OpenClawCatalog } from "@/lib/types";
+import { fetchOpenClawRuntimeOverview, isTauriRuntime, scanEnvironment } from "@/lib/tauri";
+import type { EnvironmentScan, OpenClawRuntimeOverview } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const items = [
   { to: "/diagnostics", label: "环境检测", hint: "Node · npm · Git", icon: Activity },
   { to: "/deploy", label: "一键部署", hint: "安装 · 模型 · 配置", icon: Box },
-  { to: "/recipes", label: "按配方部署", hint: "社区模板 · 敬请期待", icon: BookTemplate },
+  { to: "/runtime", label: "启动控制", hint: "Gateway · Dashboard", icon: Power },
+  { to: "/skills", label: "Skills 商店", hint: "列表 · 安装依赖", icon: Store },
   { to: "/settings", label: "设置", hint: "工作台偏好", icon: Settings2 },
 ];
 
@@ -27,10 +29,10 @@ type ShellStatusTone = "danger" | "warning" | "success" | "neutral";
 
 function deriveOpenClawStatus(
   scan: EnvironmentScan | null,
-  catalog: OpenClawCatalog | null,
+  runtime: OpenClawRuntimeOverview | null,
   loading: boolean,
 ) {
-  if (loading && !scan && !catalog) {
+  if (loading && !scan && !runtime) {
     return {
       tone: "neutral" as ShellStatusTone,
       label: "检测中",
@@ -46,7 +48,7 @@ function deriveOpenClawStatus(
     };
   }
 
-  if (!catalog?.installed) {
+  if (!runtime?.installed) {
     return {
       tone: "warning" as ShellStatusTone,
       label: "待部署",
@@ -54,18 +56,18 @@ function deriveOpenClawStatus(
     };
   }
 
-  if (catalog.runtimeStatus === "running") {
+  if (runtime.runtimeStatus === "running") {
     return {
       tone: "success" as ShellStatusTone,
       label: "运行中",
-      detail: catalog.version ? `OpenClaw ${catalog.version}` : "OpenClaw 正在运行。",
+      detail: runtime.version ? `OpenClaw ${runtime.version}` : "OpenClaw 正在运行。",
     };
   }
 
   return {
     tone: "neutral" as ShellStatusTone,
     label: "未启动",
-    detail: catalog.version ? `已安装 ${catalog.version}，等待启动。` : "已安装 OpenClaw，等待启动。",
+    detail: runtime.version ? `已安装 ${runtime.version}，等待启动。` : "已安装 OpenClaw，等待启动。",
   };
 }
 
@@ -80,7 +82,7 @@ export function AppShell() {
   const location = useLocation();
   const current = items.find((item) => item.to === location.pathname) ?? items[0];
   const [scan, setScan] = useState<EnvironmentScan | null>(null);
-  const [catalog, setCatalog] = useState<OpenClawCatalog | null>(null);
+  const [runtime, setRuntime] = useState<OpenClawRuntimeOverview | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   const [animateStatusDot, setAnimateStatusDot] = useState(false);
   const [displayedStatus, setDisplayedStatus] = useState(() =>
@@ -93,9 +95,9 @@ export function AppShell() {
 
     async function refreshStatus() {
       setStatusLoading(true);
-      const [scanResult, catalogResult] = await Promise.allSettled([
+      const [scanResult, runtimeResult] = await Promise.allSettled([
         scanEnvironment(),
-        fetchOpenClawCatalog(),
+        fetchOpenClawRuntimeOverview(),
       ]);
       if (cancelled) {
         return;
@@ -104,8 +106,8 @@ export function AppShell() {
       if (scanResult.status === "fulfilled") {
         setScan(scanResult.value);
       }
-      if (catalogResult.status === "fulfilled") {
-        setCatalog(catalogResult.value);
+      if (runtimeResult.status === "fulfilled") {
+        setRuntime(runtimeResult.value);
       }
       setStatusLoading(false);
     }
@@ -119,7 +121,7 @@ export function AppShell() {
   }, [location.pathname]);
 
   useEffect(() => {
-    const nextStatus = deriveOpenClawStatus(scan, catalog, statusLoading);
+    const nextStatus = deriveOpenClawStatus(scan, runtime, statusLoading);
     const currentVisualKey = `${displayedStatus.tone}:${displayedStatus.label}`;
     const nextVisualKey = `${nextStatus.tone}:${nextStatus.label}`;
     const detailChanged = displayedStatus.detail !== nextStatus.detail;
@@ -145,7 +147,7 @@ export function AppShell() {
       setAnimateStatusDot(false);
       statusAnimationTimerRef.current = null;
     }, 650);
-  }, [catalog, displayedStatus.detail, displayedStatus.label, displayedStatus.tone, scan, statusLoading]);
+  }, [displayedStatus.detail, displayedStatus.label, displayedStatus.tone, runtime, scan, statusLoading]);
 
   useEffect(() => {
     return () => {
