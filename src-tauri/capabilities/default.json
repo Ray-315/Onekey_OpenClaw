@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Default capability for the main OpenClaw deployer window.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

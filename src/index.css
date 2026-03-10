@@ -1,0 +1,122 @@
+@import url("https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@400;500;600;700&display=swap");
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: "Fira Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Fira Code", ui-monospace, monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-border: var(--border);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-ring: var(--ring);
+}
+
+:root {
+  --background: #f3f7fb;
+  --foreground: #0f172a;
+  --card: rgba(255, 255, 255, 0.72);
+  --card-foreground: #0f172a;
+  --border: rgba(148, 163, 184, 0.28);
+  --muted: rgba(255, 255, 255, 0.58);
+  --muted-foreground: #475569;
+  --primary: #2563eb;
+  --primary-foreground: #eff6ff;
+  --secondary: #dbeafe;
+  --secondary-foreground: #1e3a8a;
+  --accent: rgba(255, 255, 255, 0.9);
+  --accent-foreground: #0f172a;
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --ring: rgba(37, 99, 235, 0.24);
+}
+
+[data-theme="dark"] {
+  --background: #020617;
+  --foreground: #f8fafc;
+  --card: rgba(15, 23, 42, 0.72);
+  --card-foreground: #f8fafc;
+  --border: rgba(148, 163, 184, 0.16);
+  --muted: rgba(15, 23, 42, 0.58);
+  --muted-foreground: #94a3b8;
+  --primary: #38bdf8;
+  --primary-foreground: #082f49;
+  --secondary: rgba(56, 189, 248, 0.14);
+  --secondary-foreground: #e0f2fe;
+  --accent: rgba(15, 23, 42, 0.92);
+  --accent-foreground: #f8fafc;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #fb7185;
+  --ring: rgba(56, 189, 248, 0.24);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    color-scheme: light;
+  }
+
+  html[data-theme="dark"] {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    min-height: 100vh;
+    background-image:
+      radial-gradient(circle at top left, rgba(37, 99, 235, 0.22), transparent 32%),
+      radial-gradient(circle at bottom right, rgba(14, 165, 233, 0.18), transparent 28%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent);
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  ::selection {
+    background: rgba(37, 99, 235, 0.22);
+  }
+
+  html.tauri-shell-locked,
+  html.tauri-shell-locked body {
+    -webkit-touch-callout: none;
+  }
+
+  html.tauri-shell-locked :where(*):not(input):not(textarea):not([contenteditable="true"]):not([data-allow-shell-menu="true"]) {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    background: var(--card);
+    backdrop-filter: blur(22px);
+  }
+
+  .noise-mask {
+    background-image:
+      linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, transparent 45%),
+      linear-gradient(315deg, rgba(15, 23, 42, 0.04) 0%, transparent 55%);
+  }
+}
