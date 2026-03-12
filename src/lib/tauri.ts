@@ -23,17 +23,88 @@ import type {
   OpenClawDeployResult,
   OpenClawGatewayLaunchResult,
   OpenClawInstallLaunchResult,
+  OpenClawLatestVersion,
   OpenClawRuntimeOverview,
   OpenClawScanPathResult,
   OpenClawSkillDetail,
   OpenClawSkillInstallLaunchResult,
   OpenClawSkillsCatalog,
-  Platform,
+  OpenClawUpdateResult,
+  OpenClawUninstallResult,
 } from "@/lib/types";
 
 const SCAN_TIMEOUT_MS = 12_000;
 const OPENCLAW_SCAN_TIMEOUT_MS = 24_000;
-const OPENCLAW_SKILLS_TIMEOUT_MS = 20_000;
+const OPENCLAW_SKILLS_TIMEOUT_MS = 35_000;
+const OPENCLAW_UPDATE_TIMEOUT_MS = 180_000;
+const DETECTION_CACHE_TTL_MS = 5_000;
+const DETECTION_SNAPSHOT_PREFIX = "openclaw-deployer-detection:";
+
+type DetectionRequestOptions = {
+  force?: boolean;
+};
+
+type DetectionCacheKey =
+  | "environment"
+  | "openclawCatalog"
+  | "openclawRuntime"
+  | "openclawLatestVersion"
+  | "openclawSkills";
+
+type DetectionCacheEntry<T> = {
+  value?: T;
+  expiresAt: number;
+  inFlight?: Promise<T>;
+};
+
+const detectionCache = new Map<DetectionCacheKey, DetectionCacheEntry<unknown>>();
+
+function detectionCacheTtlMs(key: DetectionCacheKey) {
+  switch (key) {
+    case "openclawCatalog":
+    case "openclawSkills":
+      return 30_000;
+    default:
+      return DETECTION_CACHE_TTL_MS;
+  }
+}
+
+function supportsDetectionSnapshot(key: DetectionCacheKey) {
+  return key === "environment" || key === "openclawCatalog" || key === "openclawSkills";
+}
+
+function getDetectionSnapshotStorageKey(key: DetectionCacheKey) {
+  return `${DETECTION_SNAPSHOT_PREFIX}${key}`;
+}
+
+function readDetectionSnapshot<T>(key: DetectionCacheKey) {
+  if (!supportsDetectionSnapshot(key) || typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(getDetectionSnapshotStorageKey(key));
+    if (!raw) {
+      return null;
+    }
+
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeDetectionSnapshot<T>(key: DetectionCacheKey, value: T) {
+  if (!supportsDetectionSnapshot(key) || typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(getDetectionSnapshotStorageKey(key), JSON.stringify(value));
+  } catch {
+    // Ignore storage failures and fall back to in-memory cache only.
+  }
+}
 
 function withTimeout<T>(
   promise: Promise<T>,
@@ -45,7 +116,8 @@ function withTimeout<T>(
     const timer = window.setTimeout(() => {
       reject(
         new Error(
-          timeoutMessage ?? `${label}超时，请检查 Node.js / npm / Git / Homebrew 命令是否卡住。`,
+          timeoutMessage ??
+            `${label} timed out. Please check whether Node.js / npm / Git / Homebrew commands are blocked.`,
         ),
       );
     }, timeoutMs);
@@ -62,6 +134,68 @@ function withTimeout<T>(
   });
 }
 
+function getDetectionCacheEntry<T>(key: DetectionCacheKey) {
+  const existing = detectionCache.get(key) as DetectionCacheEntry<T> | undefined;
+  if (existing) {
+    return existing;
+  }
+
+  const created: DetectionCacheEntry<T> = { expiresAt: 0 };
+  detectionCache.set(key, created as DetectionCacheEntry<unknown>);
+  return created;
+}
+
+function peekDetectionValue<T>(key: DetectionCacheKey) {
+  const entry = getDetectionCacheEntry<T>(key);
+  if (entry.value !== undefined) {
+    return entry.value;
+  }
+
+  const snapshot = readDetectionSnapshot<T>(key);
+  if (snapshot !== null) {
+    entry.value = snapshot;
+    entry.expiresAt = 0;
+    return snapshot;
+  }
+
+  return null;
+}
+
+function loadDetectionValue<T>(
+  key: DetectionCacheKey,
+  options: DetectionRequestOptions | undefined,
+  loader: () => Promise<T>,
+) {
+  const entry = getDetectionCacheEntry<T>(key);
+  const force = options?.force ?? false;
+
+  if (!force) {
+    if (entry.value !== undefined && entry.expiresAt > Date.now()) {
+      return Promise.resolve(entry.value);
+    }
+
+    if (entry.inFlight) {
+      return entry.inFlight;
+    }
+  }
+
+  const request = loader()
+    .then((value) => {
+      entry.value = value;
+      entry.expiresAt = Date.now() + detectionCacheTtlMs(key);
+      writeDetectionSnapshot(key, value);
+      return value;
+    })
+    .finally(() => {
+      if (entry.inFlight === request) {
+        entry.inFlight = undefined;
+      }
+    });
+
+  entry.inFlight = request;
+  return request;
+}
+
 async function requestDevOpenClaw<T>(pathname: string, init?: RequestInit) {
   const response = await fetch(`/__openclaw/${pathname}`, {
     headers: {
@@ -73,7 +207,7 @@ async function requestDevOpenClaw<T>(pathname: string, init?: RequestInit) {
 
   const payload = (await response.json().catch(() => null)) as { message?: string } | null;
   if (!response.ok) {
-    throw new Error(payload?.message ?? "开发预览扫描失败，请稍后重试。");
+    throw new Error(payload?.message ?? "Development preview request failed.");
   }
 
   return payload as T;
@@ -83,12 +217,26 @@ export function isTauriRuntime() {
   return detectTauriRuntime();
 }
 
-export async function scanEnvironment() {
+async function requestEnvironmentScan(force = false) {
   if (!isTauriRuntime()) {
     return buildDemoEnvironmentScan();
   }
 
-  return withTimeout(invoke<EnvironmentScan>("scan_environment"), SCAN_TIMEOUT_MS, "环境检测");
+  return withTimeout(
+    invoke<EnvironmentScan>("scan_environment", { force }),
+    SCAN_TIMEOUT_MS,
+    "Environment scan",
+  );
+}
+
+export async function scanEnvironment(options?: DetectionRequestOptions) {
+  return loadDetectionValue("environment", options, () =>
+    requestEnvironmentScan(options?.force ?? false),
+  );
+}
+
+export function peekEnvironmentScanSnapshot() {
+  return peekDetectionValue<EnvironmentScan>("environment");
 }
 
 export async function installDependency(id: DependencyId) {
@@ -110,36 +258,50 @@ export async function switchMirrorMode(mode: MirrorMode) {
 export async function resetDemoRuntime() {
   if (!isTauriRuntime()) {
     resetDemoEnvironment();
-    return { message: "Demo 环境已重置，你可以重新逐个点击所有按钮。" };
+    return { message: "Demo environment has been reset." };
   }
 
-  return { message: "当前在 Tauri 运行时，未提供一键重置 Demo 状态。" };
+  return { message: "Demo reset is only available in browser preview." };
 }
 
-export async function fetchOpenClawCatalog() {
+async function requestOpenClawCatalog(force = false) {
   if (!isTauriRuntime()) {
     if (import.meta.env.DEV) {
-      return withTimeout(requestDevOpenClaw<OpenClawCatalog>("catalog"), OPENCLAW_SCAN_TIMEOUT_MS, "OpenClaw 检测");
+      return withTimeout(
+        requestDevOpenClaw<OpenClawCatalog>("catalog"),
+        OPENCLAW_SCAN_TIMEOUT_MS,
+        "OpenClaw catalog",
+      );
     }
 
     return buildDemoOpenClawCatalog();
   }
 
   return withTimeout(
-    invoke<OpenClawCatalog>("fetch_openclaw_catalog"),
+    invoke<OpenClawCatalog>("fetch_openclaw_catalog", { force }),
     OPENCLAW_SCAN_TIMEOUT_MS,
-    "OpenClaw 检测",
-    "OpenClaw 检测超时，请确认 OpenClaw 安装目录已加入检测路径后再重试。",
+    "OpenClaw catalog",
+    "OpenClaw catalog timed out. Please verify the scan paths and try again.",
   );
 }
 
-export async function fetchOpenClawRuntimeOverview() {
+export async function fetchOpenClawCatalog(options?: DetectionRequestOptions) {
+  return loadDetectionValue("openclawCatalog", options, () =>
+    requestOpenClawCatalog(options?.force ?? false),
+  );
+}
+
+export function peekOpenClawCatalogSnapshot() {
+  return peekDetectionValue<OpenClawCatalog>("openclawCatalog");
+}
+
+async function requestOpenClawRuntimeOverview(force = false) {
   if (!isTauriRuntime()) {
     const catalog = import.meta.env.DEV
       ? await withTimeout(
           requestDevOpenClaw<OpenClawCatalog>("catalog"),
           OPENCLAW_SCAN_TIMEOUT_MS,
-          "OpenClaw 检测",
+          "OpenClaw catalog",
         )
       : buildDemoOpenClawCatalog();
 
@@ -153,9 +315,63 @@ export async function fetchOpenClawRuntimeOverview() {
   }
 
   return withTimeout(
-    invoke<OpenClawRuntimeOverview>("fetch_openclaw_runtime_overview"),
+    invoke<OpenClawRuntimeOverview>("fetch_openclaw_runtime_overview", { force }),
     SCAN_TIMEOUT_MS,
-    "OpenClaw 运行状态",
+    "OpenClaw runtime status",
+  );
+}
+
+export async function fetchOpenClawRuntimeOverview(options?: DetectionRequestOptions) {
+  return loadDetectionValue("openclawRuntime", options, () =>
+    requestOpenClawRuntimeOverview(options?.force ?? false),
+  );
+}
+
+async function requestOpenClawLatestVersion(force = false) {
+  if (!isTauriRuntime()) {
+    const response = await fetch("https://registry.npmjs.org/openclaw/latest", {
+      headers: {
+        Accept: "application/json",
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`OpenClaw latest version request failed with status ${response.status}.`);
+    }
+
+    const payload = (await response.json()) as { version?: string };
+    const version = (payload.version || "").trim();
+    if (!version) {
+      throw new Error("OpenClaw latest version response is missing version.");
+    }
+
+    return {
+      version,
+      packageUrl: "https://www.npmjs.com/package/openclaw",
+    } satisfies OpenClawLatestVersion;
+  }
+
+  return withTimeout(
+    invoke<OpenClawLatestVersion>("fetch_openclaw_latest_version", { force }),
+    SCAN_TIMEOUT_MS,
+    "OpenClaw latest version",
+  );
+}
+
+export async function fetchOpenClawLatestVersion(options?: DetectionRequestOptions) {
+  return loadDetectionValue("openclawLatestVersion", options, () =>
+    requestOpenClawLatestVersion(options?.force ?? false),
+  );
+}
+
+export async function updateOpenClaw() {
+  if (!isTauriRuntime()) {
+    throw new Error("Manual updates are only supported in the desktop app.");
+  }
+
+  return withTimeout(
+    invoke<OpenClawUpdateResult>("update_openclaw"),
+    OPENCLAW_UPDATE_TIMEOUT_MS,
+    "OpenClaw update",
   );
 }
 
@@ -165,6 +381,14 @@ export async function installOpenClaw() {
   }
 
   return invoke<OpenClawInstallLaunchResult>("install_openclaw");
+}
+
+export async function uninstallOpenClaw() {
+  if (!isTauriRuntime()) {
+    throw new Error("Uninstall is only supported in the desktop app.");
+  }
+
+  return invoke<OpenClawUninstallResult>("uninstall_openclaw");
 }
 
 export async function registerOpenClawScanDir(path: string) {
@@ -194,9 +418,49 @@ export async function openExternalUrl(url: string) {
   await invoke("open_external_url", { url });
 }
 
+export async function minimizeAppWindow() {
+  if (!isTauriRuntime()) {
+    return;
+  }
+
+  await invoke("minimize_main_window");
+}
+
+export async function toggleAppWindowMaximize() {
+  if (!isTauriRuntime()) {
+    return false;
+  }
+
+  return invoke<boolean>("toggle_main_window_maximize");
+}
+
+export async function closeAppWindow() {
+  if (!isTauriRuntime()) {
+    return;
+  }
+
+  await invoke("close_main_window");
+}
+
+export async function isAppWindowMaximized() {
+  if (!isTauriRuntime()) {
+    return false;
+  }
+
+  return invoke<boolean>("is_main_window_maximized");
+}
+
+export async function startAppWindowDragging() {
+  if (!isTauriRuntime()) {
+    return;
+  }
+
+  await invoke("start_drag_main_window");
+}
+
 export async function launchOpenClawAuth(providerId: string) {
   if (!isTauriRuntime()) {
-    throw new Error("真实 OAuth 登录只支持桌面版 Tauri 运行时。");
+    throw new Error("OAuth login is only supported in the desktop app.");
   }
 
   return invoke<OpenClawAuthLaunchResult>("launch_openclaw_auth", {
@@ -207,7 +471,7 @@ export async function launchOpenClawAuth(providerId: string) {
 
 export async function checkOpenClawAuth(providerId: string) {
   if (!isTauriRuntime()) {
-    throw new Error("真实 OAuth 校验只支持桌面版 Tauri 运行时。");
+    throw new Error("Auth verification is only supported in the desktop app.");
   }
 
   return invoke<OpenClawAuthStatusResult>("check_openclaw_auth", {
@@ -218,7 +482,7 @@ export async function checkOpenClawAuth(providerId: string) {
 
 export async function launchOpenClawGateway() {
   if (!isTauriRuntime()) {
-    throw new Error("启动 Gateway 只支持桌面版 Tauri 运行时。");
+    throw new Error("Gateway launch is only supported in the desktop app.");
   }
 
   return invoke<OpenClawGatewayLaunchResult>("launch_openclaw_gateway");
@@ -226,7 +490,7 @@ export async function launchOpenClawGateway() {
 
 export async function openOpenClawDashboard() {
   if (!isTauriRuntime()) {
-    throw new Error("打开 Dashboard 只支持桌面版 Tauri 运行时。");
+    throw new Error("Dashboard is only supported in the desktop app.");
   }
 
   return invoke<OpenClawDashboardLaunchResult>("open_openclaw_dashboard");
@@ -234,48 +498,54 @@ export async function openOpenClawDashboard() {
 
 export async function applyOpenClawDeploy(request: OpenClawDeployRequest) {
   if (!isTauriRuntime()) {
-    throw new Error("真实一键部署只支持桌面版 Tauri 运行时。");
+    throw new Error("One-click deploy is only supported in the desktop app.");
   }
 
   return invoke<OpenClawDeployResult>("apply_openclaw_deploy", { request });
 }
 
-export async function fetchOpenClawSkills() {
-  if (!isTauriRuntime()) {
-    if (import.meta.env.DEV) {
-      return withTimeout(
-        requestDevOpenClaw<OpenClawSkillsCatalog>("skills"),
-        OPENCLAW_SKILLS_TIMEOUT_MS,
-        "Skills 列表",
-      );
+export async function fetchOpenClawSkills(options?: DetectionRequestOptions) {
+  return loadDetectionValue("openclawSkills", options, async () => {
+    if (!isTauriRuntime()) {
+      if (import.meta.env.DEV) {
+        return withTimeout(
+          requestDevOpenClaw<OpenClawSkillsCatalog>("skills"),
+          OPENCLAW_SKILLS_TIMEOUT_MS,
+          "Skills catalog",
+        );
+      }
+
+      return {
+        workspaceDir: "",
+        managedSkillsDir: "",
+        readyCount: 0,
+        totalCount: 0,
+        skills: [],
+      } satisfies OpenClawSkillsCatalog;
     }
 
-    return {
-      workspaceDir: "",
-      managedSkillsDir: "",
-      readyCount: 0,
-      totalCount: 0,
-      skills: [],
-    } satisfies OpenClawSkillsCatalog;
-  }
-
-  try {
-    return await withTimeout(
-      invoke<OpenClawSkillsCatalog>("fetch_openclaw_skills"),
-      OPENCLAW_SKILLS_TIMEOUT_MS,
-      "Skills 列表",
-    );
-  } catch (error) {
-    if (import.meta.env.DEV) {
-      return withTimeout(
-        requestDevOpenClaw<OpenClawSkillsCatalog>("skills"),
+    try {
+      return await withTimeout(
+        invoke<OpenClawSkillsCatalog>("fetch_openclaw_skills"),
         OPENCLAW_SKILLS_TIMEOUT_MS,
-        "Skills 列表",
+        "Skills catalog",
       );
-    }
+    } catch (error) {
+      if (import.meta.env.DEV) {
+        return withTimeout(
+          requestDevOpenClaw<OpenClawSkillsCatalog>("skills"),
+          OPENCLAW_SKILLS_TIMEOUT_MS,
+          "Skills catalog",
+        );
+      }
 
-    throw error;
-  }
+      throw error;
+    }
+  });
+}
+
+export function peekOpenClawSkillsSnapshot() {
+  return peekDetectionValue<OpenClawSkillsCatalog>("openclawSkills");
 }
 
 export async function fetchOpenClawSkillDetail(name: string) {
@@ -284,25 +554,25 @@ export async function fetchOpenClawSkillDetail(name: string) {
       return withTimeout(
         requestDevOpenClaw<OpenClawSkillDetail>(`skill-info?name=${encodeURIComponent(name)}`),
         OPENCLAW_SKILLS_TIMEOUT_MS,
-        "Skill 详情",
+        "Skill detail",
       );
     }
 
-    throw new Error("Skill 详情只支持桌面版 Tauri 运行时。");
+    throw new Error("Skill detail is only supported in the desktop app.");
   }
 
   try {
     return await withTimeout(
       invoke<OpenClawSkillDetail>("fetch_openclaw_skill_detail", { name }),
       OPENCLAW_SKILLS_TIMEOUT_MS,
-      "Skill 详情",
+      "Skill detail",
     );
   } catch (error) {
     if (import.meta.env.DEV) {
       return withTimeout(
         requestDevOpenClaw<OpenClawSkillDetail>(`skill-info?name=${encodeURIComponent(name)}`),
         OPENCLAW_SKILLS_TIMEOUT_MS,
-        "Skill 详情",
+        "Skill detail",
       );
     }
 
@@ -312,7 +582,7 @@ export async function fetchOpenClawSkillDetail(name: string) {
 
 export async function launchOpenClawSkillInstall(skillName: string, actionId: string) {
   if (!isTauriRuntime()) {
-    throw new Error("Skill 安装只支持桌面版 Tauri 运行时。");
+    throw new Error("Skill install is only supported in the desktop app.");
   }
 
   return invoke<OpenClawSkillInstallLaunchResult>("launch_openclaw_skill_install", {

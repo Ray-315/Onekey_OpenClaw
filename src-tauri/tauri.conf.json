@@ -12,11 +12,14 @@
   "app": {
     "windows": [
       {
-        "title": "OpenClaw 部署器",
+        "title": "OpenClaw Deployer",
         "width": 1440,
         "height": 960,
-        "minWidth": 1160,
-        "minHeight": 780,
+        "minWidth": 1600,
+        "minHeight": 980,
+        "maximized": true,
+        "decorations": false,
+        "transparent": false,
         "resizable": true
       }
     ],

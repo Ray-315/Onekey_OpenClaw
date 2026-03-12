@@ -32,14 +32,15 @@ export function RuntimePage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [dashboardUrl, setDashboardUrl] = useState<string | null>(null);
 
-  async function refreshRuntime(message?: string) {
+  async function refreshRuntime(message?: string, force = false) {
     setLoading(true);
     setError(null);
+    const shouldForce = force || Boolean(message);
 
     try {
       const [runtimeResult, catalogResult] = await Promise.allSettled([
-        fetchOpenClawRuntimeOverview(),
-        fetchOpenClawCatalog(),
+        fetchOpenClawRuntimeOverview({ force: shouldForce }),
+        fetchOpenClawCatalog({ force: shouldForce }),
       ]);
 
       if (runtimeResult.status !== "fulfilled") {
@@ -101,7 +102,7 @@ export function RuntimePage() {
     try {
       const result = await launchOpenClawGateway();
       setNotice(result.message);
-      await refreshRuntime(result.message);
+      await refreshRuntime(result.message, true);
     } catch (launchError) {
       setError(launchError instanceof Error ? launchError.message : "拉起 Gateway 失败。");
     } finally {

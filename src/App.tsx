@@ -8,6 +8,8 @@ import {
 import { ThemeProvider } from "@/components/app/theme-provider";
 import { DeployPage } from "@/pages/DeployPage";
 import { DiagnosticsPage } from "@/pages/DiagnosticsPage";
+import { ChannelWizardPage } from "@/pages/ChannelWizardPage";
+import { RecipesPage } from "@/pages/RecipesPage";
 import { RuntimePage } from "@/pages/RuntimePage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { SkillsPage } from "@/pages/SkillsPage";
@@ -22,9 +24,10 @@ function AppRoutes() {
           <Route path="/" element={<Navigate to={`/${settings.startPage}`} replace />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
           <Route path="/deploy" element={<DeployPage />} />
+          <Route path="/channels/feishu" element={<ChannelWizardPage />} />
           <Route path="/runtime" element={<RuntimePage />} />
           <Route path="/skills" element={<SkillsPage />} />
-          <Route path="/recipes" element={<Navigate to="/skills" replace />} />
+          <Route path="/recipes" element={<RecipesPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Route>
       </Routes>

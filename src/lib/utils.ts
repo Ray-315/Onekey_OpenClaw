@@ -1,6 +1,8 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
+import type { Platform } from "@/lib/types";
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
@@ -22,4 +24,12 @@ export function formatScanTime(value: string) {
 
 export function labelPlatform(platform: "macos" | "windows") {
   return platform === "macos" ? "macOS" : "Windows";
+}
+
+export function detectClientPlatform(): Platform {
+  if (typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("mac")) {
+    return "macos";
+  }
+
+  return "windows";
 }

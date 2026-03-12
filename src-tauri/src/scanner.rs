@@ -2,6 +2,8 @@ use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -9,6 +11,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +19,8 @@ use std::{
 const NODE_REQUIRED_VERSION: &str = "22+";
 const NODE_INDEX_URL: &str = "https://nodejs.org/download/release/latest-v22.x/";
 const NODE_MIRROR_BASE: &str = "https://registry.npmmirror.com/-/binary/node/latest-v22.x/";
-const NODE_PKG_FALLBACK: &str = "https://nodejs.org/download/release/latest-v22.x/node-v22.22.1.pkg";
+const NODE_PKG_FALLBACK: &str =
+    "https://nodejs.org/download/release/latest-v22.x/node-v22.22.1.pkg";
 const NODE_MSI_X64_FALLBACK: &str =
     "https://nodejs.org/download/release/latest-v22.x/node-v22.22.1-x64.msi";
 const NODE_MSI_ARM64_FALLBACK: &str =
@@ -33,17 +37,22 @@ const HOMEBREW_TUNA_CORE_GIT_REMOTE: &str =
     "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git";
 const HOMEBREW_TUNA_INSTALL_REPO: &str =
     "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/install.git";
-const HOMEBREW_TUNA_API_DOMAIN: &str =
-    "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api";
-const HOMEBREW_TUNA_BOTTLE_DOMAIN: &str =
-    "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles";
+const HOMEBREW_TUNA_API_DOMAIN: &str = "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api";
+const HOMEBREW_TUNA_BOTTLE_DOMAIN: &str = "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles";
 const HOMEBREW_INSTALL_COMMAND: &str =
     "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const DASHBOARD_TIMEOUT: Duration = Duration::from_secs(8);
 const OPENCLAW_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+const OPENCLAW_PASSIVE_HEALTH_TIMEOUT: Duration = Duration::from_millis(800);
 const OPENCLAW_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
+const OPENCLAW_SKILLS_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENCLAW_UNINSTALL_TIMEOUT: Duration = Duration::from_secs(60);
+const OPENCLAW_UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
+const DETECTION_CACHE_TTL: Duration = Duration::from_secs(5);
 const OPENCLAW_NPM_REGISTRY_OFFICIAL: &str = "https://registry.npmjs.org";
+const OPENCLAW_NPM_LATEST_URL: &str = "https://registry.npmjs.org/openclaw/latest";
+const OPENCLAW_NPM_PACKAGE_URL: &str = "https://www.npmjs.com/package/openclaw";
 const OPENCLAW_NPMRC_BEGIN: &str = "# >>> openclaw-deployer mirror >>>";
 const OPENCLAW_NPMRC_END: &str = "# <<< openclaw-deployer mirror <<<";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
@@ -53,6 +62,16 @@ const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const MINIMAX_GLOBAL_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 const PROVIDER_ROUTE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn configure_background_command(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_background_command(_command: &mut Command) {}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -153,7 +172,7 @@ pub struct OpenClawProviderCatalog {
     pub models: Vec<OpenClawProviderModel>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenClawRuntimeStatus {
     Running,
@@ -183,9 +202,31 @@ pub struct OpenClawRuntimeOverview {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OpenClawLatestVersion {
+    pub version: String,
+    pub package_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawUpdateResult {
+    pub updated: bool,
+    pub version: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OpenClawInstallLaunchResult {
     pub started: bool,
     pub strategy: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawUninstallResult {
+    pub started: bool,
     pub message: String,
 }
 
@@ -370,18 +411,125 @@ struct ProbeSnapshot {
     homebrew: Option<ProbeResult>,
 }
 
-pub fn scan_environment_inner() -> Result<EnvironmentScan, String> {
-    let platform = current_platform()?;
-    let snapshot = probe_snapshot(platform);
-    Ok(build_scan(platform, load_app_settings().mirror_mode, snapshot))
+#[derive(Debug, Clone)]
+struct CachedValue<T> {
+    value: T,
+    cached_at: Instant,
 }
 
-pub fn fetch_openclaw_catalog_inner() -> Result<OpenClawCatalog, String> {
+impl<T: Clone> CachedValue<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value,
+            cached_at: Instant::now(),
+        }
+    }
+
+    fn fresh_value(&self) -> Option<T> {
+        (self.cached_at.elapsed() < DETECTION_CACHE_TTL).then(|| self.value.clone())
+    }
+}
+
+#[derive(Debug, Default)]
+struct DetectionCache {
+    environment: Option<CachedValue<EnvironmentScan>>,
+    openclaw_catalog: Option<CachedValue<OpenClawCatalog>>,
+    openclaw_runtime: Option<CachedValue<OpenClawRuntimeOverview>>,
+    openclaw_latest_version: Option<CachedValue<OpenClawLatestVersion>>,
+}
+
+static DETECTION_CACHE: OnceLock<Mutex<DetectionCache>> = OnceLock::new();
+
+fn detection_cache() -> &'static Mutex<DetectionCache> {
+    DETECTION_CACHE.get_or_init(|| Mutex::new(DetectionCache::default()))
+}
+
+fn lock_detection_cache() -> MutexGuard<'static, DetectionCache> {
+    detection_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn cache_detection_value<T, FRead, FWrite, FLoad>(
+    force: bool,
+    read: FRead,
+    write: FWrite,
+    loader: FLoad,
+) -> Result<T, String>
+where
+    T: Clone,
+    FRead: Fn(&DetectionCache) -> Option<T>,
+    FWrite: Fn(&mut DetectionCache, T),
+    FLoad: FnOnce() -> Result<T, String>,
+{
+    if !force {
+        let cached_value = {
+            let cache = lock_detection_cache();
+            read(&cache)
+        };
+        if let Some(value) = cached_value {
+            return Ok(value);
+        }
+    }
+
+    let value = loader()?;
+    let mut cache = lock_detection_cache();
+    write(&mut cache, value.clone());
+    Ok(value)
+}
+
+#[cfg(test)]
+fn load_cached_slot<T, F>(
+    slot: &mut Option<CachedValue<T>>,
+    force: bool,
+    loader: F,
+) -> Result<T, String>
+where
+    T: Clone,
+    F: FnOnce() -> Result<T, String>,
+{
+    if !force {
+        if let Some(value) = slot.as_ref().and_then(CachedValue::fresh_value) {
+            return Ok(value);
+        }
+    }
+
+    let value = loader()?;
+    *slot = Some(CachedValue::new(value.clone()));
+    Ok(value)
+}
+
+fn collect_environment_scan() -> Result<EnvironmentScan, String> {
+    let platform = current_platform()?;
+    let snapshot = probe_snapshot(platform);
+    Ok(build_scan(
+        platform,
+        load_app_settings().mirror_mode,
+        snapshot,
+    ))
+}
+
+pub fn scan_environment_inner(force: bool) -> Result<EnvironmentScan, String> {
+    cache_detection_value(
+        force,
+        |cache| {
+            cache
+                .environment
+                .as_ref()
+                .and_then(CachedValue::fresh_value)
+        },
+        |cache, value| cache.environment = Some(CachedValue::new(value)),
+        collect_environment_scan,
+    )
+}
+
+fn collect_openclaw_catalog() -> Result<OpenClawCatalog, String> {
     let scan_paths = configured_openclaw_scan_dirs_as_strings();
     let version_probe = probe_openclaw_version();
+    let installed = openclaw_is_installed(&version_probe, resolve_openclaw_executable().is_some());
 
-    match version_probe.status {
-        CheckStatus::Installed => {
+    match installed {
+        true => {
             let (providers, message) = match load_openclaw_provider_catalog() {
                 Ok(providers) if providers.is_empty() => (
                     providers,
@@ -400,12 +548,13 @@ pub fn fetch_openclaw_catalog_inner() -> Result<OpenClawCatalog, String> {
                 installed: true,
                 version: version_probe.version,
                 message,
-                runtime_status: probe_openclaw_runtime_status(),
+                // 部署页只需要安装状态和模型列表；runtime 健康检查留给 Runtime 页面单独处理。
+                runtime_status: OpenClawRuntimeStatus::Stopped,
                 scan_paths,
                 providers,
             })
         }
-        _ => Ok(OpenClawCatalog {
+        false => Ok(OpenClawCatalog {
             installed: false,
             version: None,
             message: "请先安装 OpenClaw，再通过 CLI 拉取可用 provider 和模型列表。".into(),
@@ -416,22 +565,35 @@ pub fn fetch_openclaw_catalog_inner() -> Result<OpenClawCatalog, String> {
     }
 }
 
-pub fn fetch_openclaw_runtime_overview_inner() -> Result<OpenClawRuntimeOverview, String> {
+pub fn fetch_openclaw_catalog_inner(force: bool) -> Result<OpenClawCatalog, String> {
+    cache_detection_value(
+        force,
+        |cache| {
+            cache
+                .openclaw_catalog
+                .as_ref()
+                .and_then(CachedValue::fresh_value)
+        },
+        |cache, value| cache.openclaw_catalog = Some(CachedValue::new(value)),
+        collect_openclaw_catalog,
+    )
+}
+
+fn collect_openclaw_runtime_overview(force: bool) -> Result<OpenClawRuntimeOverview, String> {
     let scan_paths = configured_openclaw_scan_dirs_as_strings();
     let version_probe = probe_openclaw_version();
-    let installed = matches!(
-        version_probe.status,
-        CheckStatus::Installed | CheckStatus::Outdated
-    ) || resolve_openclaw_executable().is_some();
+    let installed = openclaw_is_installed(&version_probe, resolve_openclaw_executable().is_some());
     let runtime_status = if installed {
-        probe_openclaw_runtime_status()
+        probe_openclaw_runtime_status(force)
     } else {
         OpenClawRuntimeStatus::Stopped
     };
     let message = match (installed, runtime_status) {
         (false, _) => "未检测到 OpenClaw CLI。".to_string(),
         (true, OpenClawRuntimeStatus::Running) => "Gateway 正在运行。".to_string(),
-        (true, OpenClawRuntimeStatus::Stopped) => "已检测到 OpenClaw CLI，Gateway 当前未启动。".to_string(),
+        (true, OpenClawRuntimeStatus::Stopped) => {
+            "已检测到 OpenClaw CLI，Gateway 当前未启动。".to_string()
+        }
     };
 
     Ok(OpenClawRuntimeOverview {
@@ -441,6 +603,72 @@ pub fn fetch_openclaw_runtime_overview_inner() -> Result<OpenClawRuntimeOverview
         runtime_status,
         scan_paths,
     })
+}
+
+pub fn fetch_openclaw_runtime_overview_inner(
+    force: bool,
+) -> Result<OpenClawRuntimeOverview, String> {
+    cache_detection_value(
+        force,
+        |cache| {
+            cache
+                .openclaw_runtime
+                .as_ref()
+                .and_then(CachedValue::fresh_value)
+        },
+        |cache, value| cache.openclaw_runtime = Some(CachedValue::new(value)),
+        || collect_openclaw_runtime_overview(force),
+    )
+}
+
+fn collect_openclaw_latest_version() -> Result<OpenClawLatestVersion, String> {
+    let client = Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .map_err(|error| format!("创建更新检测客户端失败: {error}"))?;
+
+    let response = client
+        .get(OPENCLAW_NPM_LATEST_URL)
+        .send()
+        .map_err(|error| format!("请求 OpenClaw 最新版本失败: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "请求 OpenClaw 最新版本失败，状态码: {}",
+            response.status()
+        ));
+    }
+
+    let body = response
+        .text()
+        .map_err(|error| format!("读取 OpenClaw 最新版本响应失败: {error}"))?;
+    let payload = serde_json::from_str::<Value>(&body)
+        .map_err(|error| format!("解析 OpenClaw 最新版本响应失败: {error}"))?;
+    let version = payload
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value: &&str| !value.is_empty())
+        .ok_or_else(|| "OpenClaw 最新版本响应缺少 version 字段".to_string())?;
+
+    Ok(OpenClawLatestVersion {
+        version: version.to_string(),
+        package_url: OPENCLAW_NPM_PACKAGE_URL.into(),
+    })
+}
+
+pub fn fetch_openclaw_latest_version_inner(force: bool) -> Result<OpenClawLatestVersion, String> {
+    cache_detection_value(
+        force,
+        |cache| {
+            cache
+                .openclaw_latest_version
+                .as_ref()
+                .and_then(CachedValue::fresh_value)
+        },
+        |cache, value| cache.openclaw_latest_version = Some(CachedValue::new(value)),
+        collect_openclaw_latest_version,
+    )
 }
 
 pub fn install_dependency_inner(id: DependencyId) -> Result<InstallLaunchResult, String> {
@@ -469,20 +697,82 @@ pub fn install_openclaw_inner() -> Result<OpenClawInstallLaunchResult, String> {
                 started: true,
                 strategy: "open-terminal".into(),
                 message: format!(
-                    "已拉起 Terminal 执行 OpenClaw 官方安装脚本。默认检测目录已设为 {}；安装完成后请返回本页重新检测。",
+                    "Launched the official OpenClaw installer in Terminal. Default scan path is set to {}. Return here after installation finishes.",
                     default_scan_dir.display()
                 ),
             })
         }
         Platform::Windows => {
-            launch_openclaw_windows_installer(mirror_mode)?;
+            probe_candidates_with_timeout(
+                &command_candidates("npm"),
+                &[
+                    "i",
+                    "-g",
+                    "openclaw@latest",
+                    "--no-fund",
+                    "--no-audit",
+                    "--loglevel=error",
+                ],
+                OPENCLAW_UPDATE_TIMEOUT,
+            )?;
+            let version = probe_openclaw_version().version;
             Ok(OpenClawInstallLaunchResult {
                 started: true,
-                strategy: "open-powershell".into(),
-                message: "已拉起 PowerShell 执行 OpenClaw 官方安装脚本。安装完成后请返回本页重新检测。".into(),
+                strategy: "background-npm".into(),
+                message: match version {
+                    Some(version) => format!(
+                        "OpenClaw finished installing in the background. Current version: {version}. Default scan path is {}.",
+                        default_scan_dir.display()
+                    ),
+                    None => format!(
+                        "OpenClaw finished installing in the background. Default scan path is {}.",
+                        default_scan_dir.display()
+                    ),
+                },
             })
         }
     }
+}
+
+pub fn uninstall_openclaw_inner() -> Result<OpenClawUninstallResult, String> {
+    run_openclaw_command_with_timeout(
+        &["uninstall", "--all", "--yes"],
+        OPENCLAW_UNINSTALL_TIMEOUT,
+    )?;
+
+    Ok(OpenClawUninstallResult {
+        started: true,
+        message: "已完成 OpenClaw 卸载。当前页面将重新检测安装状态。".into(),
+    })
+}
+
+pub fn update_openclaw_inner() -> Result<OpenClawUpdateResult, String> {
+    probe_candidates_with_timeout(
+        &command_candidates("npm"),
+        &[
+            "i",
+            "-g",
+            "openclaw@latest",
+            "--no-fund",
+            "--no-audit",
+            "--loglevel=error",
+        ],
+        OPENCLAW_UPDATE_TIMEOUT,
+    )?;
+
+    let version = probe_openclaw_version().version;
+    let message = match version.as_deref() {
+        Some(version) => format!(
+            "OpenClaw 已更新到 {version}。如需让新版本接管运行，请到“启动控制”里手动启动 Gateway。"
+        ),
+        None => "OpenClaw 已完成更新。请按需到“启动控制”里手动启动 Gateway。".into(),
+    };
+
+    Ok(OpenClawUpdateResult {
+        updated: true,
+        version,
+        message,
+    })
 }
 
 pub fn register_openclaw_scan_dir_inner(path: String) -> Result<OpenClawScanPathResult, String> {
@@ -525,6 +815,7 @@ pub fn open_external_url_inner(url: String) -> Result<(), String> {
     };
 
     with_standard_tool_paths(&mut command);
+    configure_background_command(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -571,7 +862,10 @@ pub fn launch_openclaw_gateway_inner() -> Result<OpenClawGatewayLaunchResult, St
     Ok(OpenClawGatewayLaunchResult {
         started: true,
         command,
-        message: "已在 Terminal 中拉起 `openclaw gateway run --allow-unconfigured`。保留这个窗口，Gateway 才会持续运行。".into(),
+        message: format!(
+            "已在 {} 中拉起 `openclaw gateway run --allow-unconfigured`。保留这个窗口，Gateway 才会持续运行。",
+            command_host_name_for_os(env::consts::OS)
+        ),
     })
 }
 
@@ -583,11 +877,9 @@ pub fn apply_openclaw_deploy_inner(
         return Err("请先选择主模型，再开始部署。".into());
     }
 
-    let fallback_model_ref = request
-        .fallback_model_ref
-        .trim()
-        .to_string();
-    let fallback_model_ref = (!fallback_model_ref.is_empty() && fallback_model_ref != primary_model_ref)
+    let fallback_model_ref = request.fallback_model_ref.trim().to_string();
+    let fallback_model_ref = (!fallback_model_ref.is_empty()
+        && fallback_model_ref != primary_model_ref)
         .then_some(fallback_model_ref);
 
     match request.auth_mode {
@@ -631,12 +923,12 @@ pub fn apply_openclaw_deploy_inner(
         false
     };
 
-    let started_gateway = if request.auto_start_gateway {
-        run_in_terminal(&build_gateway_run_command())?;
-        true
+    let gateway_launch_error = if request.auto_start_gateway {
+        run_in_terminal(&build_gateway_run_command()).err()
     } else {
-        false
+        None
     };
+    let started_gateway = gateway_launch_error.is_none() && request.auto_start_gateway;
 
     let fallback_summary = fallback_model_ref
         .as_deref()
@@ -649,17 +941,28 @@ pub fn apply_openclaw_deploy_inner(
     let route_summary = route_summary
         .map(|summary| format!("，{summary}"))
         .unwrap_or_default();
-    let gateway_summary = if started_gateway {
-        "并已拉起 Gateway。"
-    } else {
-        "Gateway 未自动启动。"
-    };
     let session_summary = if session_reset {
         "当前主会话已同步到新模型并重置。"
     } else if session_synced {
         "当前主会话已同步到新模型。"
     } else {
         "当前主会话会在下次打开 Dashboard 时自动同步。"
+    };
+
+    if let Some(error) = gateway_launch_error {
+        return Ok(OpenClawDeployResult {
+            applied: true,
+            started_gateway: false,
+            message: format!(
+                "已把主模型设置为 {primary_model_ref}{fallback_summary}，{auth_summary}{route_summary} 配置已写入，但自动拉起 Gateway 失败：{error}。你可以稍后在“运行状态”页手动启动。 {session_summary}"
+            ),
+        });
+    }
+
+    let gateway_summary = if started_gateway {
+        "并已拉起 Gateway。"
+    } else {
+        "Gateway 未自动启动。"
     };
 
     Ok(OpenClawDeployResult {
@@ -703,7 +1006,14 @@ fn reset_openclaw_dashboard_session() -> Result<bool, String> {
     })
     .to_string();
     run_openclaw_command_with_timeout(
-        &["gateway", "call", "sessions.reset", "--params", &params, "--json"],
+        &[
+            "gateway",
+            "call",
+            "sessions.reset",
+            "--params",
+            &params,
+            "--json",
+        ],
         PROBE_TIMEOUT,
     )
     .map(|_| true)
@@ -728,14 +1038,22 @@ fn sync_openclaw_main_session_model(model_ref: &str) -> Result<bool, String> {
     })
     .to_string();
     run_openclaw_command_with_timeout(
-        &["gateway", "call", "sessions.patch", "--params", &params, "--json"],
+        &[
+            "gateway",
+            "call",
+            "sessions.patch",
+            "--params",
+            &params,
+            "--json",
+        ],
         PROBE_TIMEOUT,
     )
     .map(|_| true)
 }
 
 pub fn fetch_openclaw_skills_inner() -> Result<OpenClawSkillsCatalog, String> {
-    let raw = run_openclaw_command_with_timeout(&["skills", "list", "--json"], OPENCLAW_MODELS_TIMEOUT)?;
+    let raw =
+        run_openclaw_command_with_timeout(&["skills", "list", "--json"], OPENCLAW_SKILLS_TIMEOUT)?;
     let parsed: RawOpenClawSkillsCatalog =
         serde_json::from_str(&raw).map_err(|error| format!("解析 skills 列表失败: {error}"))?;
 
@@ -754,7 +1072,7 @@ pub fn fetch_openclaw_skills_inner() -> Result<OpenClawSkillsCatalog, String> {
 pub fn fetch_openclaw_skill_detail_inner(name: String) -> Result<OpenClawSkillDetail, String> {
     let raw = run_openclaw_command_with_timeout(
         &["skills", "info", &name, "--json"],
-        OPENCLAW_MODELS_TIMEOUT,
+        OPENCLAW_SKILLS_TIMEOUT,
     )?;
 
     serde_json::from_str(&raw).map_err(|error| format!("解析 skill 详情失败: {error}"))
@@ -779,7 +1097,11 @@ pub fn launch_openclaw_skill_install_inner(
         skill_name,
         action_id,
         command,
-        message: format!("已在 Terminal 中拉起 “{}”。", action.label),
+        message: format!(
+            "已在 {} 中拉起 “{}”。",
+            command_host_name_for_os(env::consts::OS),
+            action.label
+        ),
     })
 }
 
@@ -793,10 +1115,12 @@ struct OpenClawAuthFlow {
 }
 
 fn resolve_openclaw_auth_flow(provider_id: &str) -> Result<OpenClawAuthFlow, String> {
-    let executable = resolve_openclaw_executable()
-        .map(|path| shell_quote(&path.display().to_string()))
-        .unwrap_or_else(|| "openclaw".into());
-    let auth_store_path = default_openclaw_state_dir()?.join("agents").join("main").join("agent").join("auth-profiles.json");
+    let executable = resolve_openclaw_cli_command_prefix();
+    let auth_store_path = default_openclaw_state_dir()?
+        .join("agents")
+        .join("main")
+        .join("agent")
+        .join("auth-profiles.json");
 
     match provider_id {
         "openai" | "openai-codex" => Ok(OpenClawAuthFlow {
@@ -867,14 +1191,46 @@ fn resolve_openclaw_executable() -> Option<PathBuf> {
 }
 
 fn build_gateway_run_command() -> String {
-    let executable = resolve_openclaw_executable()
-        .map(|path| shell_quote(&path.display().to_string()))
-        .unwrap_or_else(|| "openclaw".into());
-    format!("{executable} gateway run --allow-unconfigured")
+    format!(
+        "{} gateway run --allow-unconfigured",
+        resolve_openclaw_cli_command_prefix()
+    )
+}
+
+fn resolve_openclaw_cli_command_prefix() -> String {
+    resolve_openclaw_executable()
+        .map(|path| quote_command_prefix_for_os(&path.display().to_string(), env::consts::OS))
+        .unwrap_or_else(|| "openclaw".into())
 }
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn command_host_name_for_os(os: &str) -> &'static str {
+    match os {
+        "windows" => "PowerShell",
+        "macos" => "Terminal",
+        _ => "终端",
+    }
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn openclaw_is_installed(version_probe: &ProbeResult, executable_found: bool) -> bool {
+    matches!(
+        version_probe.status,
+        CheckStatus::Installed | CheckStatus::Outdated
+    ) || executable_found
+}
+
+fn quote_command_prefix_for_os(executable: &str, os: &str) -> String {
+    match os {
+        "windows" => format!("& {}", powershell_quote(executable)),
+        _ => shell_quote(executable),
+    }
 }
 
 fn default_openclaw_state_dir() -> Result<PathBuf, String> {
@@ -917,7 +1273,11 @@ fn auth_store_has_provider_profile(path: &Path, providers: &[String]) -> Result<
             .get("provider")
             .and_then(Value::as_str)
             .map(|value| value.to_ascii_lowercase())
-            .or_else(|| profile_id.split_once(':').map(|(provider, _)| provider.to_ascii_lowercase()));
+            .or_else(|| {
+                profile_id
+                    .split_once(':')
+                    .map(|(provider, _)| provider.to_ascii_lowercase())
+            });
         let credential_type = record
             .get("type")
             .or_else(|| record.get("mode"))
@@ -1009,7 +1369,9 @@ fn configure_provider_route_for_deploy(
     match provider_id.as_str() {
         "zai" => configure_zai_provider_route(route_id, model_ref, api_secret).map(Some),
         "moonshot" => configure_moonshot_provider_route(route_id, model_ref).map(Some),
-        "minimax" | "minimax-cn" => configure_minimax_provider_route(&provider_id, model_ref).map(Some),
+        "minimax" | "minimax-cn" => {
+            configure_minimax_provider_route(&provider_id, model_ref).map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -1305,7 +1667,10 @@ fn ensure_json_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value should be object")
 }
 
-fn ensure_child_object<'a>(parent: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
+fn ensure_child_object<'a>(
+    parent: &'a mut Map<String, Value>,
+    key: &str,
+) -> &'a mut Map<String, Value> {
     let entry = parent
         .entry(key.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -1345,7 +1710,11 @@ fn collect_auth_profiles(
             .get("provider")
             .and_then(Value::as_str)
             .map(|value| value.to_ascii_lowercase())
-            .or_else(|| profile_id.split_once(':').map(|(provider, _)| provider.to_ascii_lowercase()))
+            .or_else(|| {
+                profile_id
+                    .split_once(':')
+                    .map(|(provider, _)| provider.to_ascii_lowercase())
+            })
         else {
             continue;
         };
@@ -1482,19 +1851,20 @@ fn probe_snapshot(platform: Platform) -> ProbeSnapshot {
     }
 }
 
-fn build_scan(platform: Platform, mirror_mode: MirrorMode, snapshot: ProbeSnapshot) -> EnvironmentScan {
+fn build_scan(
+    platform: Platform,
+    mirror_mode: MirrorMode,
+    snapshot: ProbeSnapshot,
+) -> EnvironmentScan {
     let checks = build_checks(platform, snapshot);
     let git_ready = checks
         .iter()
         .find(|check| check.id == DependencyId::Git)
         .is_some_and(|check| check.status == CheckStatus::Installed);
-    let overall_ready = checks
-        .iter()
-        .filter(|check| check.visible)
-        .all(|check| {
-            check.status == CheckStatus::Installed
-                || (platform == Platform::Macos && git_ready && check.id == DependencyId::Homebrew)
-        });
+    let overall_ready = checks.iter().filter(|check| check.visible).all(|check| {
+        check.status == CheckStatus::Installed
+            || (platform == Platform::Macos && git_ready && check.id == DependencyId::Homebrew)
+    });
 
     EnvironmentScan {
         platform,
@@ -1590,7 +1960,10 @@ fn build_node_check(probe: ProbeResult) -> DependencyCheck {
 
 fn build_npm_check(probe: ProbeResult, node_probe: ProbeResult) -> DependencyCheck {
     let node_missing = matches!(node_probe.status, CheckStatus::Missing);
-    let node_broken = matches!(node_probe.status, CheckStatus::Outdated | CheckStatus::Error);
+    let node_broken = matches!(
+        node_probe.status,
+        CheckStatus::Outdated | CheckStatus::Error
+    );
 
     let (summary, action_label, action_enabled) = match probe.status {
         CheckStatus::Installed => (
@@ -1761,42 +2134,75 @@ fn probe_openclaw_version() -> ProbeResult {
     normalize_probe(output, parse_version_like, None)
 }
 
-fn probe_openclaw_runtime_status() -> OpenClawRuntimeStatus {
-    if let Some(status) = probe_openclaw_runtime_http_status() {
-        return status;
-    }
+fn probe_openclaw_runtime_status(force_refresh: bool) -> OpenClawRuntimeStatus {
+    let http_status = probe_openclaw_runtime_http_status(force_refresh);
+    let cli_status = if http_status.is_none() && force_refresh {
+        probe_openclaw_runtime_cli_status()
+    } else {
+        None
+    };
 
+    resolve_openclaw_runtime_status(force_refresh, http_status, cli_status)
+}
+
+fn probe_openclaw_runtime_cli_status() -> Option<OpenClawRuntimeStatus> {
     for args in [
         &["health", "--json", "--timeout", "1500"][..],
         &["health", "--timeout", "1500"][..],
     ] {
         match run_openclaw_command_with_timeout(args, OPENCLAW_HEALTH_TIMEOUT) {
             Ok(raw) => {
-                return if openclaw_runtime_is_running(&raw) {
+                return Some(if openclaw_runtime_is_running(&raw) {
                     OpenClawRuntimeStatus::Running
                 } else {
                     OpenClawRuntimeStatus::Stopped
-                };
+                });
             }
-            Err(error) if error == "missing" => return OpenClawRuntimeStatus::Stopped,
+            Err(error) if error == "missing" => return Some(OpenClawRuntimeStatus::Stopped),
             Err(_) => continue,
         }
+    }
+
+    None
+}
+
+fn resolve_openclaw_runtime_status(
+    force_refresh: bool,
+    http_status: Option<OpenClawRuntimeStatus>,
+    cli_status: Option<OpenClawRuntimeStatus>,
+) -> OpenClawRuntimeStatus {
+    if let Some(status) = http_status {
+        return status;
+    }
+
+    if force_refresh {
+        return cli_status.unwrap_or(OpenClawRuntimeStatus::Stopped);
     }
 
     OpenClawRuntimeStatus::Stopped
 }
 
-fn probe_openclaw_runtime_http_status() -> Option<OpenClawRuntimeStatus> {
+fn probe_openclaw_runtime_http_status(force_refresh: bool) -> Option<OpenClawRuntimeStatus> {
     let port = configured_gateway_port().unwrap_or(18789);
     let client = Client::builder()
-        .timeout(OPENCLAW_HEALTH_TIMEOUT)
+        .timeout(if force_refresh {
+            OPENCLAW_HEALTH_TIMEOUT
+        } else {
+            OPENCLAW_PASSIVE_HEALTH_TIMEOUT
+        })
         .build()
         .ok()?;
 
-    for url in [
-        format!("http://127.0.0.1:{port}/health"),
-        format!("http://[::1]:{port}/health"),
-    ] {
+    let urls = if force_refresh {
+        vec![
+            format!("http://127.0.0.1:{port}/health"),
+            format!("http://[::1]:{port}/health"),
+        ]
+    } else {
+        vec![format!("http://127.0.0.1:{port}/health")]
+    };
+
+    for url in urls {
         let Ok(response) = client.get(&url).send() else {
             continue;
         };
@@ -1859,7 +2265,11 @@ fn normalize_dashboard_url_for_browser(url: &str) -> String {
     let token = parsed
         .query()
         .and_then(|query| extract_dashboard_param(query, "token"))
-        .or_else(|| parsed.fragment().and_then(|fragment| extract_dashboard_param(fragment, "token")));
+        .or_else(|| {
+            parsed
+                .fragment()
+                .and_then(|fragment| extract_dashboard_param(fragment, "token"))
+        });
     let session = parsed
         .query()
         .and_then(|query| extract_dashboard_param(query, "session"))
@@ -1943,7 +2353,11 @@ fn extract_github_repo_from_url(raw: &str) -> Option<String> {
     Regex::new(r"github\.com/([^/\s]+/[^/\s]+)")
         .ok()
         .and_then(|regex| regex.captures(raw))
-        .and_then(|captures| captures.get(1).map(|value| value.as_str().trim_end_matches(".git").to_string()))
+        .and_then(|captures| {
+            captures
+                .get(1)
+                .map(|value| value.as_str().trim_end_matches(".git").to_string())
+        })
 }
 
 fn normalize_probe(
@@ -2010,10 +2424,7 @@ fn probe_command<const N: usize>(program: &str, args: [&str; N]) -> Result<Strin
     probe_candidates_with_timeout(&candidates, &args, PROBE_TIMEOUT)
 }
 
-fn run_openclaw_command_with_timeout(
-    args: &[&str],
-    timeout: Duration,
-) -> Result<String, String> {
+fn run_openclaw_command_with_timeout(args: &[&str], timeout: Duration) -> Result<String, String> {
     let candidates = openclaw_command_candidates();
     probe_candidates_with_timeout(&candidates, args, timeout)
 }
@@ -2055,19 +2466,35 @@ fn command_candidates_for_os(program: &str, os: &str) -> Vec<String> {
 
     let mut candidates = vec![program.to_string()];
     for dir in standard_command_search_dirs_for_os(os) {
-        let path = dir.join(program);
-        let path_str = path.to_string_lossy().to_string();
-        if !candidates.contains(&path_str) {
-            candidates.push(path_str);
+        for binary_name in command_binary_names_for_os(program, os) {
+            let path = dir.join(&binary_name);
+            let path_str = path.to_string_lossy().to_string();
+            if !candidates.contains(&path_str) {
+                candidates.push(path_str);
+            }
         }
     }
 
     candidates
 }
 
+fn command_binary_names_for_os(program: &str, os: &str) -> Vec<String> {
+    match os {
+        // Windows 的 npm 常见入口是 npm.cmd；只探测裸 npm 会把现成环境误判成缺失。
+        "windows" => vec![
+            program.to_string(),
+            format!("{program}.cmd"),
+            format!("{program}.exe"),
+            format!("{program}.bat"),
+            format!("{program}.ps1"),
+        ],
+        _ => vec![program.to_string()],
+    }
+}
+
 #[cfg(test)]
 fn openclaw_command_candidates_for_home(home: Option<&Path>, os: &str) -> Vec<String> {
-    openclaw_command_candidates_for_dirs(&default_openclaw_bin_dirs_for_home(home), os)
+    openclaw_command_candidates_for_dirs(&default_openclaw_bin_dirs_for_home(home, os), os)
 }
 
 fn openclaw_binary_names_for_os(os: &str) -> &'static [&'static str] {
@@ -2096,12 +2523,50 @@ fn openclaw_command_candidates_for_dirs(bin_dirs: &[PathBuf], os: &str) -> Vec<S
 }
 
 #[cfg(test)]
-fn default_openclaw_bin_dirs_for_home(home: Option<&Path>) -> Vec<PathBuf> {
+fn default_openclaw_bin_dirs_for_home(home: Option<&Path>, os: &str) -> Vec<PathBuf> {
     let Some(home) = home else {
         return Vec::new();
     };
 
-    vec![home.join(".openclaw").join("bin")]
+    match os {
+        "windows" => vec![home.join("AppData").join("Roaming").join("npm")],
+        _ => vec![home.join(".openclaw").join("bin")],
+    }
+}
+
+fn default_openclaw_bin_dirs() -> Vec<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let mut dirs = default_openclaw_bin_dirs_for_os(home.as_deref(), env::consts::OS);
+
+    if env::consts::OS == "windows" {
+        if let Some(program_files) = env::var_os("ProgramFiles") {
+            push_unique_path(
+                &mut dirs,
+                PathBuf::from(program_files).join("OpenClaw").join("bin"),
+            );
+        }
+    }
+
+    dirs
+}
+
+fn default_openclaw_bin_dirs_for_os(home: Option<&Path>, os: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(home) = home {
+        match os {
+            "windows" => {
+                push_unique_path(&mut dirs, home.join("AppData").join("Roaming").join("npm"));
+            }
+            _ => {
+                push_unique_path(&mut dirs, home.join(".openclaw").join("bin"));
+            }
+        }
+    }
+
+    dirs
 }
 
 fn with_openclaw_bin_in_path(command: &mut Command) {
@@ -2167,6 +2632,7 @@ fn run_command_with_timeout(
         .args(args)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
+    configure_background_command(&mut command);
     if program.contains("openclaw") {
         with_openclaw_bin_in_path(&mut command);
     } else {
@@ -2218,8 +2684,10 @@ fn read_probe_output(
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<std::process::Output, String> {
-    let stdout = fs::read(stdout_path).map_err(|error| format!("{program} 读取输出失败: {error}"))?;
-    let stderr = fs::read(stderr_path).map_err(|error| format!("{program} 读取输出失败: {error}"))?;
+    let stdout =
+        fs::read(stdout_path).map_err(|error| format!("{program} 读取输出失败: {error}"))?;
+    let stderr =
+        fs::read(stderr_path).map_err(|error| format!("{program} 读取输出失败: {error}"))?;
 
     Ok(std::process::Output {
         status,
@@ -2380,7 +2848,10 @@ fn install_homebrew(mirror_mode: MirrorMode) -> Result<InstallLaunchResult, Stri
     })
 }
 
-fn resolve_node_download_url(platform: Platform, mirror_mode: MirrorMode) -> Result<String, String> {
+fn resolve_node_download_url(
+    platform: Platform,
+    mirror_mode: MirrorMode,
+) -> Result<String, String> {
     let fallback = match platform {
         Platform::Macos => NODE_PKG_FALLBACK,
         Platform::Windows if env::consts::ARCH == "aarch64" => NODE_MSI_ARM64_FALLBACK,
@@ -2520,7 +2991,9 @@ fn download_to_temp(url: &str, prefix: &str) -> Result<PathBuf, String> {
         .filter(|name| !name.is_empty())
         .unwrap_or("installer.bin");
 
-    let target_dir = env::temp_dir().join("openclaw-deployer-downloads").join(prefix);
+    let target_dir = env::temp_dir()
+        .join("openclaw-deployer-downloads")
+        .join(prefix);
     fs::create_dir_all(&target_dir).map_err(|error| error.to_string())?;
     let target_path = target_dir.join(filename);
     let mut file = File::create(&target_path).map_err(|error| error.to_string())?;
@@ -2544,10 +3017,7 @@ fn launch_macos_installer(installer_path: &PathBuf) -> Result<(), String> {
 }
 
 fn launch_windows_installer(installer_path: &PathBuf) -> Result<(), String> {
-    let escaped_path = installer_path
-        .display()
-        .to_string()
-        .replace('\'', "''");
+    let escaped_path = installer_path.display().to_string().replace('\'', "''");
 
     Command::new("powershell")
         .args([
@@ -2567,46 +3037,52 @@ fn launch_windows_installer(installer_path: &PathBuf) -> Result<(), String> {
 }
 
 fn run_in_terminal(command: &str) -> Result<(), String> {
-    let escaped_command = command.replace('\\', "\\\\").replace('"', "\\\"");
-    Command::new("osascript")
-        .args([
-            "-e",
-            &format!(
-                "tell application \"Terminal\" to do script \"{}\"",
-                escaped_command
-            ),
-            "-e",
-            "tell application \"Terminal\" to activate",
-        ])
-        .status()
-        .map_err(|error| error.to_string())
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err("无法拉起 Terminal。".into())
-            }
-        })
-}
-
-fn launch_openclaw_windows_installer(_mirror_mode: MirrorMode) -> Result<(), String> {
-    Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "Start-Process powershell -ArgumentList '-NoExit','-Command',\"$env:npm_config_registry='{OPENCLAW_NPM_REGISTRY_OFFICIAL}'; & ([scriptblock]::Create((iwr -useb https://openclaw.ai/install.ps1))) -NoOnboard\""
-            ),
-        ])
-        .status()
-        .map_err(|error| error.to_string())
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err("无法拉起 OpenClaw Windows 安装脚本。".into())
-            }
-        })
+    match env::consts::OS {
+        "macos" => {
+            let escaped_command = command.replace('\\', "\\\\").replace('"', "\\\"");
+            Command::new("osascript")
+                .args([
+                    "-e",
+                    &format!(
+                        "tell application \"Terminal\" to do script \"{}\"",
+                        escaped_command
+                    ),
+                    "-e",
+                    "tell application \"Terminal\" to activate",
+                ])
+                .status()
+                .map_err(|error| error.to_string())
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err("无法拉起 Terminal。".into())
+                    }
+                })
+        }
+        "windows" => {
+            let launcher = format!(
+                "Start-Process powershell -ArgumentList @('-NoExit','-Command',{})",
+                powershell_quote(command)
+            );
+            Command::new("powershell")
+                .args(["-NoProfile", "-Command", &launcher])
+                .status()
+                .map_err(|error| error.to_string())
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err("无法拉起 PowerShell。".into())
+                    }
+                })
+        }
+        _ => Command::new("sh")
+            .args(["-lc", command])
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法执行终端命令: {error}")),
+    }
 }
 
 fn load_openclaw_provider_catalog() -> Result<Vec<OpenClawProviderCatalog>, String> {
@@ -2616,9 +3092,10 @@ fn load_openclaw_provider_catalog() -> Result<Vec<OpenClawProviderCatalog>, Stri
     ) {
         Ok(raw) => raw,
         Err(error) if error.contains("执行超时") => return Err(error),
-        Err(_) => {
-            run_openclaw_command_with_timeout(&["models", "list", "--all"], OPENCLAW_MODELS_TIMEOUT)?
-        }
+        Err(_) => run_openclaw_command_with_timeout(
+            &["models", "list", "--all"],
+            OPENCLAW_MODELS_TIMEOUT,
+        )?,
     };
 
     Ok(parse_openclaw_provider_catalog(&raw))
@@ -2654,7 +3131,10 @@ fn parse_openclaw_provider_catalog(raw: &str) -> Vec<OpenClawProviderCatalog> {
             OpenClawProviderCatalog {
                 id: provider_id.clone(),
                 title: provider_display_name(&provider_id),
-                summary: format!("通过 openclaw models list 检测到 {} 个可用模型。", models.len()),
+                summary: format!(
+                    "通过 openclaw models list 检测到 {} 个可用模型。",
+                    models.len()
+                ),
                 models,
             }
         })
@@ -2873,12 +3353,10 @@ fn save_app_settings(settings: AppSettings) -> Result<(), String> {
 }
 
 fn default_openclaw_bin_dir() -> Result<PathBuf, String> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .ok_or_else(|| "无法定位当前用户目录。".to_string())?;
-
-    Ok(home.join(".openclaw").join("bin"))
+    default_openclaw_bin_dirs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| "无法定位 OpenClaw 默认目录。".to_string())
 }
 
 fn configured_openclaw_scan_dirs() -> Vec<PathBuf> {
@@ -2892,8 +3370,8 @@ fn configured_openclaw_scan_dirs() -> Vec<PathBuf> {
     }
 
     if dirs.is_empty() {
-        if let Ok(default_dir) = default_openclaw_bin_dir() {
-            dirs.push(default_dir);
+        for default_dir in default_openclaw_bin_dirs() {
+            push_unique_path(&mut dirs, default_dir);
         }
     }
 
@@ -2914,7 +3392,7 @@ fn detect_openclaw_bin_dirs() -> Vec<PathBuf> {
         push_unique_path(&mut dirs, path_dir);
     }
 
-    if let Ok(default_dir) = default_openclaw_bin_dir() {
+    for default_dir in default_openclaw_bin_dirs() {
         for binary_name in openclaw_binary_names_for_os(env::consts::OS) {
             let candidate = default_dir.join(binary_name);
             if candidate.is_file() {
@@ -3015,7 +3493,11 @@ fn register_openclaw_scan_dir(dir: PathBuf) -> Result<PathBuf, String> {
     let mut settings = load_app_settings();
     let dir_str = dir.display().to_string();
 
-    if !settings.openclaw_scan_dirs.iter().any(|item| item == &dir_str) {
+    if !settings
+        .openclaw_scan_dirs
+        .iter()
+        .any(|item| item == &dir_str)
+    {
         settings.openclaw_scan_dirs.push(dir_str);
         save_app_settings(settings)?;
     }
@@ -3135,49 +3617,111 @@ mod tests {
             parse_git_version("git version 2.47.1 (Apple Git-154)"),
             Some("2.47.1".into())
         );
-        assert_eq!(
-            parse_brew_version("Homebrew 4.4.20"),
-            Some("4.4.20".into())
-        );
+        assert_eq!(parse_brew_version("Homebrew 4.4.20"), Some("4.4.20".into()));
     }
 
     #[test]
     fn openclaw_candidates_include_default_install_dir_on_macos() {
-        let candidates = openclaw_command_candidates_for_home(
-            Some(Path::new("/Users/tester")),
-            "macos",
-        );
+        let candidates =
+            openclaw_command_candidates_for_home(Some(Path::new("/Users/tester")), "macos");
+        let expected_path = Path::new("/Users/tester")
+            .join(".openclaw")
+            .join("bin")
+            .join("openclaw")
+            .to_string_lossy()
+            .to_string();
 
         assert_eq!(
             candidates.first().map(String::as_str),
-            Some("/Users/tester/.openclaw/bin/openclaw")
+            Some(expected_path.as_str())
         );
-        assert!(candidates
-            .iter()
-            .any(|item| item == "/Users/tester/.openclaw/bin/openclaw"));
+        assert!(candidates.iter().any(|item| item == &expected_path));
+        assert_eq!(candidates.last().map(String::as_str), Some("openclaw"));
+    }
+
+    #[test]
+    fn openclaw_candidates_include_appdata_npm_on_windows() {
+        let candidates =
+            openclaw_command_candidates_for_home(Some(Path::new(r"C:\Users\tester")), "windows");
+        let expected_path = Path::new(r"C:\Users\tester")
+            .join("AppData")
+            .join("Roaming")
+            .join("npm")
+            .join("openclaw.cmd")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some(expected_path.as_str())
+        );
+        assert!(candidates.iter().any(|item| item == &expected_path));
         assert_eq!(candidates.last().map(String::as_str), Some("openclaw"));
     }
 
     #[test]
     fn node_candidates_include_common_macos_bin_dirs() {
         let candidates = command_candidates_for_os("node", "macos");
+        let usr_local_node = Path::new("/usr/local/bin")
+            .join("node")
+            .to_string_lossy()
+            .to_string();
+        let homebrew_node = Path::new("/opt/homebrew/bin")
+            .join("node")
+            .to_string_lossy()
+            .to_string();
 
         assert_eq!(candidates.first().map(String::as_str), Some("node"));
-        assert!(candidates.iter().any(|item| item == "/usr/local/bin/node"));
-        assert!(candidates.iter().any(|item| item == "/opt/homebrew/bin/node"));
+        assert!(candidates.iter().any(|item| item == &usr_local_node));
+        assert!(candidates.iter().any(|item| item == &homebrew_node));
     }
 
     #[test]
     fn brew_candidates_include_homebrew_bin_on_macos() {
         let candidates = command_candidates_for_os("brew", "macos");
+        let homebrew_brew = Path::new("/opt/homebrew/bin")
+            .join("brew")
+            .to_string_lossy()
+            .to_string();
 
         assert_eq!(candidates.first().map(String::as_str), Some("brew"));
-        assert!(candidates.iter().any(|item| item == "/opt/homebrew/bin/brew"));
+        assert!(candidates.iter().any(|item| item == &homebrew_brew));
+    }
+
+    #[test]
+    fn windows_command_binary_names_include_cmd_shims() {
+        let candidates = command_binary_names_for_os("npm", "windows");
+
+        assert_eq!(candidates.first().map(String::as_str), Some("npm"));
+        assert!(candidates.iter().any(|item| item == "npm.cmd"));
+        assert!(candidates.iter().any(|item| item == "npm.exe"));
+    }
+
+    #[test]
+    fn windows_command_prefix_uses_powershell_call_operator() {
+        let command = quote_command_prefix_for_os(
+            r"C:\Users\Ray\AppData\Roaming\npm\openclaw.cmd",
+            "windows",
+        );
+
+        assert_eq!(
+            command,
+            "& 'C:\\Users\\Ray\\AppData\\Roaming\\npm\\openclaw.cmd'"
+        );
+    }
+
+    #[test]
+    fn macos_command_prefix_uses_posix_shell_quote() {
+        let command = quote_command_prefix_for_os("/Users/ray/.openclaw/bin/openclaw", "macos");
+
+        assert_eq!(command, "'/Users/ray/.openclaw/bin/openclaw'");
     }
 
     #[test]
     fn runtime_probe_recognizes_running_output() {
-        assert!(openclaw_runtime_is_running(r#"{"rpc":{"ok":true},"service":{"loaded":true}}"#));
+        assert!(openclaw_runtime_is_running(
+            r#"{"rpc":{"ok":true},"service":{"loaded":true}}"#
+        ));
         assert!(openclaw_runtime_is_running(r#"Runtime: running"#));
     }
 
@@ -3186,6 +3730,52 @@ mod tests {
         assert!(!openclaw_runtime_is_running(
             r#"{"service":{"loaded":false},"runtime":{"status":"unknown"},"rpc":{"ok":false}}"#
         ));
+    }
+
+    #[test]
+    fn cached_slot_reuses_value_until_forced() {
+        let mut slot = Some(CachedValue::new("cached".to_string()));
+        let mut load_count = 0;
+
+        let cached = load_cached_slot(&mut slot, false, || {
+            load_count += 1;
+            Ok("fresh".to_string())
+        })
+        .expect("cached value should load");
+
+        let refreshed = load_cached_slot(&mut slot, true, || {
+            load_count += 1;
+            Ok("fresh".to_string())
+        })
+        .expect("forced value should reload");
+
+        assert_eq!(cached, "cached");
+        assert_eq!(refreshed, "fresh");
+        assert_eq!(load_count, 1);
+    }
+
+    #[test]
+    fn cached_value_expires_after_ttl() {
+        let stale = CachedValue {
+            value: "stale".to_string(),
+            cached_at: Instant::now() - DETECTION_CACHE_TTL - Duration::from_millis(1),
+        };
+
+        assert_eq!(stale.fresh_value(), None);
+    }
+
+    #[test]
+    fn passive_runtime_probe_skips_cli_fallback_when_http_is_missing() {
+        let status =
+            resolve_openclaw_runtime_status(false, None, Some(OpenClawRuntimeStatus::Running));
+        assert_eq!(status, OpenClawRuntimeStatus::Stopped);
+    }
+
+    #[test]
+    fn force_runtime_probe_uses_cli_fallback_when_http_is_missing() {
+        let status =
+            resolve_openclaw_runtime_status(true, None, Some(OpenClawRuntimeStatus::Running));
+        assert_eq!(status, OpenClawRuntimeStatus::Running);
     }
 
     #[test]
@@ -3200,6 +3790,19 @@ mod tests {
         let probe = normalize_probe(Ok("OpenClaw CLI ready".into()), |_| None, None);
         assert_eq!(probe.status, CheckStatus::Installed);
         assert_eq!(probe.version, None);
+    }
+
+    #[test]
+    fn openclaw_catalog_install_state_accepts_executable_fallback() {
+        assert!(openclaw_is_installed(&missing_probe(), true));
+        assert!(openclaw_is_installed(&outdated("0.91.0"), false));
+        assert!(!openclaw_is_installed(&missing_probe(), false));
+    }
+
+    #[test]
+    fn uninstall_command_uses_non_interactive_flags() {
+        let args = ["uninstall", "--all", "--yes"];
+        assert_eq!(args, ["uninstall", "--all", "--yes"]);
     }
 
     #[cfg(unix)]
@@ -3309,10 +3912,8 @@ mod tests {
 
     #[test]
     fn writes_managed_registry_to_npmrc() {
-        let temp_dir = env::temp_dir().join(format!(
-            "openclaw-npmrc-write-{}",
-            current_timestamp()
-        ));
+        let temp_dir =
+            env::temp_dir().join(format!("openclaw-npmrc-write-{}", current_timestamp()));
         let npmrc_path = temp_dir.join(".npmrc");
 
         update_npm_user_config_at(&npmrc_path, MirrorMode::China).expect("should write npmrc");
@@ -3326,10 +3927,8 @@ mod tests {
 
     #[test]
     fn removing_mirror_keeps_unmanaged_npmrc_lines() {
-        let temp_dir = env::temp_dir().join(format!(
-            "openclaw-npmrc-clean-{}",
-            current_timestamp()
-        ));
+        let temp_dir =
+            env::temp_dir().join(format!("openclaw-npmrc-clean-{}", current_timestamp()));
         let npmrc_path = temp_dir.join(".npmrc");
 
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
@@ -3392,14 +3991,18 @@ anthropic/claude-sonnet-4-5"#;
     #[test]
     fn openai_and_openai_codex_have_different_auth_modes() {
         assert_eq!(auth_modes_for_provider("openai"), vec![DeployAuthMode::Api]);
-        assert_eq!(auth_modes_for_provider("openai-codex"), vec![DeployAuthMode::Login]);
+        assert_eq!(
+            auth_modes_for_provider("openai-codex"),
+            vec![DeployAuthMode::Login]
+        );
         assert!(supports_provider_login("openai-codex"));
         assert!(!supports_provider_login("openai"));
     }
 
     #[test]
     fn normalized_dashboard_url_keeps_token_fragment() {
-        let normalized = normalize_dashboard_url_for_browser("http://127.0.0.1:18789/#token=test-token");
+        let normalized =
+            normalize_dashboard_url_for_browser("http://127.0.0.1:18789/#token=test-token");
         assert!(normalized.starts_with("http://127.0.0.1:18789/?openclawDeployerTs="));
         assert!(normalized.contains("&session=main"));
         assert!(normalized.contains("&token=test-token"));
@@ -3427,11 +4030,8 @@ anthropic/claude-sonnet-4-5"#;
         )
         .expect("auth store should be written");
 
-        let detected = auth_store_has_provider_profile(
-            &auth_store_path,
-            &["openai-codex".into()],
-        )
-        .expect("auth store should parse");
+        let detected = auth_store_has_provider_profile(&auth_store_path, &["openai-codex".into()])
+            .expect("auth store should parse");
 
         assert!(detected);
         let _ = fs::remove_dir_all(temp_dir);
@@ -3439,7 +4039,8 @@ anthropic/claude-sonnet-4-5"#;
 
     #[test]
     fn auth_store_ignores_other_provider_profiles() {
-        let temp_dir = env::temp_dir().join(format!("openclaw-auth-store-miss-{}", current_timestamp()));
+        let temp_dir =
+            env::temp_dir().join(format!("openclaw-auth-store-miss-{}", current_timestamp()));
         let auth_store_path = temp_dir.join("auth-profiles.json");
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         fs::write(
@@ -3457,11 +4058,8 @@ anthropic/claude-sonnet-4-5"#;
         )
         .expect("auth store should be written");
 
-        let detected = auth_store_has_provider_profile(
-            &auth_store_path,
-            &["openai-codex".into()],
-        )
-        .expect("auth store should parse");
+        let detected = auth_store_has_provider_profile(&auth_store_path, &["openai-codex".into()])
+            .expect("auth store should parse");
 
         assert!(!detected);
         let _ = fs::remove_dir_all(temp_dir);

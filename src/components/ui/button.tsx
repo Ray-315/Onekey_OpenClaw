@@ -17,9 +17,9 @@ const variants = {
 
 const sizes = {
   default: "h-11 px-4 py-2 text-sm",
-  sm: "h-9 rounded-xl px-3 text-sm",
-  lg: "h-12 rounded-2xl px-5 text-sm",
-  icon: "size-11 rounded-2xl p-0",
+  sm: "h-9 rounded-[1.1rem] px-3 text-sm",
+  lg: "h-12 rounded-[1.4rem] px-5 text-sm",
+  icon: "size-11 rounded-[1.4rem] p-0",
 } as const;
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
@@ -37,7 +37,7 @@ export function Button({
   return (
     <button
       className={cn(
-        "inline-flex cursor-pointer items-center justify-center gap-2 rounded-2xl font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-4 disabled:cursor-not-allowed disabled:opacity-50",
+        "inline-flex cursor-pointer items-center justify-center gap-2 rounded-[1.4rem] font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-4 disabled:cursor-not-allowed disabled:opacity-50",
         variants[variant],
         sizes[size],
         className,

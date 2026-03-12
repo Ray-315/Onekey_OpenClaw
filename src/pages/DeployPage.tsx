@@ -30,9 +30,9 @@ import {
   checkOpenClawAuth,
   fetchOpenClawCatalog,
   installOpenClaw,
-  isTauriRuntime,
   launchOpenClawAuth,
   openExternalUrl,
+  peekOpenClawCatalogSnapshot,
   registerOpenClawScanDir,
 } from "@/lib/tauri";
 import type {
@@ -805,6 +805,7 @@ function InstallOpenClawView({
   catalog,
   refreshing,
   installing,
+  installProgress,
   savingScanPath,
   message,
   error,
@@ -818,6 +819,7 @@ function InstallOpenClawView({
   catalog: OpenClawCatalog | null;
   refreshing: boolean;
   installing: boolean;
+  installProgress: { value: number; label: string } | null;
   savingScanPath: boolean;
   message: string | null;
   error: string | null;
@@ -850,13 +852,27 @@ function InstallOpenClawView({
                 ) : (
                   <PackagePlus className="size-4" />
                 )}
-                {installing ? "安装脚本已拉起" : "安装 OpenClaw"}
+                {installing ? "Installing..." : "Install OpenClaw"}
               </Button>
               <Button disabled={refreshing} onClick={onRefresh} variant="outline">
                 {refreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
                 重新检测
               </Button>
             </div>
+            {installProgress ? (
+              <div className="mt-5 space-y-2 rounded-[24px] border border-border/70 bg-foreground/4 p-4">
+                <div className="flex items-center justify-between text-sm text-muted-foreground">
+                  <span>{installProgress.label}</span>
+                  <span>{installProgress.value}%</span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full rounded-full bg-primary transition-[width] duration-300 ease-out"
+                    style={{ width: `${installProgress.value}%` }}
+                  />
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <div className="space-y-4 p-6">
@@ -947,14 +963,18 @@ function InstallOpenClawView({
 
 export function DeployPage() {
   const { settings } = useWorkbenchSettings();
-  const [catalogState, setCatalogState] = useState<CatalogState>("loading");
-  const [catalog, setCatalog] = useState<OpenClawCatalog | null>(null);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const initialCatalog = peekOpenClawCatalogSnapshot();
+  const [catalogState, setCatalogState] = useState<CatalogState>(initialCatalog ? "ready" : "loading");
+  const [catalog, setCatalog] = useState<OpenClawCatalog | null>(initialCatalog);
+  const [statusMessage, setStatusMessage] = useState<string | null>(initialCatalog?.message ?? null);
   const [error, setError] = useState<string | null>(null);
   const [installingOpenClaw, setInstallingOpenClaw] = useState(false);
+  const [installProgress, setInstallProgress] = useState<{ value: number; label: string } | null>(
+    null,
+  );
   const [savingScanPath, setSavingScanPath] = useState(false);
   const [manualScanPath, setManualScanPath] = useState("");
-  const [scanPaths, setScanPaths] = useState<string[]>([]);
+  const [scanPaths, setScanPaths] = useState<string[]>(() => initialCatalog?.scanPaths ?? []);
   const [config, setConfig] = useState<DeployConfig>(() => buildPlanConfig("quickstart"));
   const [configModalOpen, setConfigModalOpen] = useState(false);
   const [loginStatus, setLoginStatus] = useState<LoginStatus>("idle");
@@ -964,12 +984,13 @@ export function DeployPage() {
   const [deployApplied, setDeployApplied] = useState(false);
   const [lastSummary, setLastSummary] = useState<string | null>(null);
 
-  async function refreshCatalog(nextMessage?: string) {
+  async function refreshCatalog(nextMessage?: string, force = false) {
     setError(null);
     setCatalogState("loading");
+    const shouldForce = force || Boolean(nextMessage);
 
     try {
-      const result = await fetchOpenClawCatalog();
+      const result = await fetchOpenClawCatalog({ force: shouldForce });
       setCatalog(result);
       setScanPaths(result.scanPaths);
       setCatalogState("ready");
@@ -1092,22 +1113,27 @@ export function DeployPage() {
 
   async function handleInstallOpenClaw() {
     setInstallingOpenClaw(true);
+    setInstallProgress({ value: 12, label: "Preparing install" });
     setError(null);
     setStatusMessage(null);
 
     try {
+      setInstallProgress({ value: 68, label: "Installing OpenClaw" });
       const result = await installOpenClaw();
-      setStatusMessage(settings.showInstallNotice ? result.message : null);
-
-      if (!isTauriRuntime()) {
-        await refreshCatalog(settings.showInstallNotice ? result.message : undefined);
-      }
+      setInstallProgress({ value: 92, label: "Verifying installation" });
+      const installMessage = settings.showInstallNotice ? result.message : "OpenClaw installed.";
+      setStatusMessage(installMessage);
+      await refreshCatalog(installMessage);
+      setInstallProgress({ value: 100, label: "Install complete" });
     } catch (installError) {
       setError(
         installError instanceof Error ? installError.message : "拉起 OpenClaw 安装失败，请稍后重试。",
       );
     } finally {
       setInstallingOpenClaw(false);
+      window.setTimeout(() => {
+        setInstallProgress(null);
+      }, 600);
     }
   }
 
@@ -1360,6 +1386,7 @@ export function DeployPage() {
         catalog={catalog}
         error={error}
         installing={installingOpenClaw}
+        installProgress={installProgress}
         refreshing={catalogState === "loading"}
         manualScanPath={manualScanPath}
         message={statusMessage}
@@ -1373,7 +1400,7 @@ export function DeployPage() {
           void handleSaveScanPath();
         }}
         onRefresh={() => {
-          void refreshCatalog();
+          void refreshCatalog(undefined, true);
         }}
       />
     );

@@ -31,17 +31,22 @@ function detectPlatform(): Platform {
   return navigator.userAgent.toLowerCase().includes("mac") ? "macos" : "windows";
 }
 
+function defaultOpenClawScanPath(platform: Platform) {
+  return platform === "macos" ? "~/.openclaw/bin" : "C:\\Users\\Ray\\AppData\\Roaming\\npm";
+}
+
 function defaultState(): DemoRuntimeState {
+  const platform = detectPlatform();
   const mirrorMode = window.localStorage.getItem(MIRROR_STORAGE_KEY) === "china" ? "china" : "official";
   return {
-    platform: detectPlatform(),
+    platform,
     mirrorMode,
     nodeVersion: null,
     npmVersion: null,
     gitVersion: null,
     homebrewVersion: null,
     openclawVersion: null,
-    openclawScanPaths: ["~/.openclaw/bin"],
+    openclawScanPaths: [defaultOpenClawScanPath(platform)],
   };
 }
 
@@ -418,16 +423,17 @@ export function buildDemoOpenClawCatalog(): OpenClawCatalog {
 
 export function applyDemoOpenClawInstall(): OpenClawInstallLaunchResult {
   const state = loadState();
+  const defaultScanPath = defaultOpenClawScanPath(state.platform);
   state.openclawVersion = "0.91.0";
-  if (!state.openclawScanPaths.includes("~/.openclaw/bin")) {
-    state.openclawScanPaths.unshift("~/.openclaw/bin");
+  if (!state.openclawScanPaths.includes(defaultScanPath)) {
+    state.openclawScanPaths.unshift(defaultScanPath);
   }
   saveState(state);
 
   return {
     started: true,
     strategy: "preview",
-    message: "Demo 已模拟安装 OpenClaw 0.91.0，并自动登记 ~/.openclaw/bin 作为扫描目录。",
+    message: `Demo 已模拟安装 OpenClaw 0.91.0，并自动登记 ${defaultScanPath} 作为扫描目录。`,
   };
 }
 

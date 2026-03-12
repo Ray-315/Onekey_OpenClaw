@@ -20,6 +20,7 @@ import {
   fetchOpenClawSkills,
   launchOpenClawSkillInstall,
   openExternalUrl,
+  peekOpenClawSkillsSnapshot,
 } from "@/lib/tauri";
 import type {
   OpenClawSkillDetail,
@@ -44,24 +45,30 @@ function missingSummary(skill: OpenClawSkillSummary | OpenClawSkillDetail) {
 }
 
 export function SkillsPage() {
-  const [catalog, setCatalog] = useState<OpenClawSkillsCatalog | null>(null);
+  const initialCatalog = peekOpenClawSkillsSnapshot();
+  const [catalog, setCatalog] = useState<OpenClawSkillsCatalog | null>(initialCatalog);
   const [filter, setFilter] = useState<SkillFilter>("all");
   const [keyword, setKeyword] = useState("");
   const [selectedName, setSelectedName] = useState<string>("");
   const [detail, setDetail] = useState<OpenClawSkillDetail | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!initialCatalog);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [installingActionId, setInstallingActionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(
+    initialCatalog
+      ? `已读取 ${initialCatalog.totalCount} 个 skills，其中 ${initialCatalog.readyCount} 个已就绪。`
+      : null,
+  );
 
-  async function refreshSkills(message?: string) {
+  async function refreshSkills(message?: string, force = false) {
     setLoading(true);
     setError(null);
+    const shouldForce = force || Boolean(message);
 
     try {
-      const result = await fetchOpenClawSkills();
+      const result = await fetchOpenClawSkills({ force: shouldForce });
       setCatalog(result);
       setNotice(message ?? `已读取 ${result.totalCount} 个 skills，其中 ${result.readyCount} 个已就绪。`);
     } catch (skillsError) {
@@ -126,7 +133,7 @@ export function SkillsPage() {
     try {
       const result = await launchOpenClawSkillInstall(detail.name, action.id);
       setNotice(result.message);
-      await refreshSkills(result.message);
+      await refreshSkills(result.message, true);
       const latestDetail = await fetchOpenClawSkillDetail(detail.name);
       setDetail(latestDetail);
     } catch (installError) {

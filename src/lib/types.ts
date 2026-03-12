@@ -69,9 +69,25 @@ export interface OpenClawRuntimeOverview {
   scanPaths: string[];
 }
 
+export interface OpenClawLatestVersion {
+  version: string;
+  packageUrl: string;
+}
+
+export interface OpenClawUpdateResult {
+  updated: boolean;
+  version?: string | null;
+  message: string;
+}
+
 export interface OpenClawInstallLaunchResult {
   started: boolean;
   strategy: string;
+  message: string;
+}
+
+export interface OpenClawUninstallResult {
+  started: boolean;
   message: string;
 }
 

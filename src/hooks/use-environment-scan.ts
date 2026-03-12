@@ -1,9 +1,10 @@
-import { useWorkbenchSettings } from "@/components/app/app-settings-provider";
 import { startTransition, useEffect, useEffectEvent, useRef, useState } from "react";
 
+import { useWorkbenchSettings } from "@/components/app/app-settings-provider";
 import {
   installDependency,
   isTauriRuntime,
+  peekEnvironmentScanSnapshot,
   resetDemoRuntime,
   scanEnvironment,
   switchMirrorMode,
@@ -11,13 +12,15 @@ import {
 import type { DependencyId, EnvironmentScan, MirrorMode } from "@/lib/types";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
+
 const FOCUS_SCAN_THROTTLE_MS = 15_000;
 const SCAN_DEADLINE_MS = 10_000;
 
 export function useEnvironmentScan() {
   const { settings } = useWorkbenchSettings();
-  const [scan, setScan] = useState<EnvironmentScan | null>(null);
-  const [state, setState] = useState<LoadState>("idle");
+  const initialScan = peekEnvironmentScanSnapshot();
+  const [scan, setScan] = useState<EnvironmentScan | null>(initialScan);
+  const [state, setState] = useState<LoadState>(initialScan ? "ready" : "idle");
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -29,7 +32,7 @@ export function useEnvironmentScan() {
   const activeScanIdRef = useRef(0);
   const scanDeadlineTimerRef = useRef<number | null>(null);
 
-  const runScan = useEffectEvent(async (nextMessage?: string) => {
+  const runScan = useEffectEvent(async (nextMessage?: string, force = false) => {
     if (scanInFlightRef.current) {
       return;
     }
@@ -39,11 +42,13 @@ export function useEnvironmentScan() {
     activeScanIdRef.current = requestId;
     scanInFlightRef.current = true;
     setError(null);
+
     if (previousScan) {
       setIsRefreshing(true);
     } else {
       setState("loading");
     }
+
     if (nextMessage) {
       setMessage(nextMessage);
     }
@@ -66,7 +71,7 @@ export function useEnvironmentScan() {
     }, SCAN_DEADLINE_MS);
 
     try {
-      const result = await scanEnvironment();
+      const result = await scanEnvironment({ force });
       if (activeScanIdRef.current !== requestId) {
         return;
       }
@@ -82,9 +87,7 @@ export function useEnvironmentScan() {
       }
 
       setState(previousScan ? "ready" : "error");
-      setError(
-        scanError instanceof Error ? scanError.message : "环境检测失败，请稍后重试。",
-      );
+      setError(scanError instanceof Error ? scanError.message : "环境检测失败，请稍后重试。");
     } finally {
       if (activeScanIdRef.current === requestId) {
         if (scanDeadlineTimerRef.current !== null) {
@@ -136,20 +139,19 @@ export function useEnvironmentScan() {
   }, []);
 
   async function refresh() {
-    await runScan("已重新执行环境检测。");
+    await runScan("已重新执行环境检测。", true);
   }
 
   async function install(id: DependencyId) {
     setInstallingId(id);
     setError(null);
     setMessage(null);
+
     try {
       const result = await installDependency(id);
       setMessage(settings.showInstallNotice ? result.message : null);
     } catch (installError) {
-      setError(
-        installError instanceof Error ? installError.message : "安装命令拉起失败，请稍后再试。",
-      );
+      setError(installError instanceof Error ? installError.message : "安装命令拉起失败，请稍后再试。");
     } finally {
       setInstallingId(null);
     }
@@ -161,11 +163,9 @@ export function useEnvironmentScan() {
 
     try {
       const result = await switchMirrorMode(mode);
-      await runScan(result.message);
+      await runScan(result.message, true);
     } catch (mirrorError) {
-      setError(
-        mirrorError instanceof Error ? mirrorError.message : "镜像源切换失败，请稍后再试。",
-      );
+      setError(mirrorError instanceof Error ? mirrorError.message : "镜像源切换失败，请稍后再试。");
     } finally {
       setSwitchingMirror(false);
     }
@@ -175,7 +175,7 @@ export function useEnvironmentScan() {
     setResettingDemo(true);
     try {
       const result = await resetDemoRuntime();
-      await runScan(result.message);
+      await runScan(result.message, true);
     } finally {
       setResettingDemo(false);
     }

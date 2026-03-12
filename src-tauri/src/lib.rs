@@ -1,25 +1,63 @@
 mod scanner;
 
 use scanner::{
-    apply_openclaw_deploy_inner,
-    check_openclaw_auth_inner, fetch_openclaw_catalog_inner, fetch_openclaw_runtime_overview_inner,
-    fetch_openclaw_skill_detail_inner,
-    fetch_openclaw_skills_inner, install_dependency_inner, install_openclaw_inner,
-    launch_openclaw_auth_inner, launch_openclaw_gateway_inner,
-    launch_openclaw_skill_install_inner, open_external_url_inner,
-    open_openclaw_dashboard_inner, register_openclaw_scan_dir_inner, scan_environment_inner,
-    switch_mirror_mode_inner, DependencyId, EnvironmentScan, InstallLaunchResult, MirrorMode,
-    MirrorSwitchResult, OpenClawAuthLaunchResult, OpenClawAuthStatusResult, OpenClawCatalog,
-    OpenClawDashboardLaunchResult, OpenClawDeployRequest, OpenClawDeployResult,
-    OpenClawGatewayLaunchResult, OpenClawInstallLaunchResult, OpenClawScanPathResult,
-    OpenClawRuntimeOverview, OpenClawSkillDetail, OpenClawSkillInstallLaunchResult,
-    OpenClawSkillsCatalog,
+    apply_openclaw_deploy_inner, check_openclaw_auth_inner, fetch_openclaw_catalog_inner,
+    fetch_openclaw_latest_version_inner, fetch_openclaw_runtime_overview_inner,
+    fetch_openclaw_skill_detail_inner, fetch_openclaw_skills_inner, install_dependency_inner,
+    install_openclaw_inner, launch_openclaw_auth_inner, launch_openclaw_gateway_inner,
+    launch_openclaw_skill_install_inner, open_external_url_inner, open_openclaw_dashboard_inner,
+    register_openclaw_scan_dir_inner, scan_environment_inner, switch_mirror_mode_inner,
+    uninstall_openclaw_inner, update_openclaw_inner, DependencyId, EnvironmentScan,
+    InstallLaunchResult, MirrorMode, MirrorSwitchResult, OpenClawAuthLaunchResult,
+    OpenClawAuthStatusResult, OpenClawCatalog, OpenClawDashboardLaunchResult,
+    OpenClawDeployRequest, OpenClawDeployResult, OpenClawGatewayLaunchResult,
+    OpenClawInstallLaunchResult, OpenClawLatestVersion, OpenClawRuntimeOverview,
+    OpenClawScanPathResult, OpenClawSkillDetail, OpenClawSkillInstallLaunchResult,
+    OpenClawSkillsCatalog, OpenClawUninstallResult, OpenClawUpdateResult,
 };
 use tauri::{Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
-async fn scan_environment() -> Result<EnvironmentScan, String> {
-    tauri::async_runtime::spawn_blocking(scan_environment_inner)
+fn minimize_main_window(window: tauri::Window) -> Result<(), String> {
+    window.minimize().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn toggle_main_window_maximize(window: tauri::Window) -> Result<bool, String> {
+    let maximized = window.is_maximized().map_err(|error| error.to_string())?;
+
+    if maximized {
+        window.unmaximize().map_err(|error| error.to_string())?;
+        Ok(false)
+    } else {
+        window.maximize().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+fn close_main_window(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn is_main_window_maximized(window: tauri::Window) -> Result<bool, String> {
+    window.is_maximized().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_drag_main_window(window: tauri::Window) -> Result<(), String> {
+    if window.is_maximized().map_err(|error| error.to_string())? {
+        window.unmaximize().map_err(|error| error.to_string())?;
+    }
+
+    window.start_dragging().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn scan_environment(force: Option<bool>) -> Result<EnvironmentScan, String> {
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || scan_environment_inner(force))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -39,15 +77,29 @@ async fn switch_mirror_mode(mode: MirrorMode) -> Result<MirrorSwitchResult, Stri
 }
 
 #[tauri::command]
-async fn fetch_openclaw_catalog() -> Result<OpenClawCatalog, String> {
-    tauri::async_runtime::spawn_blocking(fetch_openclaw_catalog_inner)
+async fn fetch_openclaw_catalog(force: Option<bool>) -> Result<OpenClawCatalog, String> {
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || fetch_openclaw_catalog_inner(force))
         .await
         .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-async fn fetch_openclaw_runtime_overview() -> Result<OpenClawRuntimeOverview, String> {
-    tauri::async_runtime::spawn_blocking(fetch_openclaw_runtime_overview_inner)
+async fn fetch_openclaw_runtime_overview(
+    force: Option<bool>,
+) -> Result<OpenClawRuntimeOverview, String> {
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || fetch_openclaw_runtime_overview_inner(force))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn fetch_openclaw_latest_version(
+    force: Option<bool>,
+) -> Result<OpenClawLatestVersion, String> {
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || fetch_openclaw_latest_version_inner(force))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -55,6 +107,20 @@ async fn fetch_openclaw_runtime_overview() -> Result<OpenClawRuntimeOverview, St
 #[tauri::command]
 async fn install_openclaw() -> Result<OpenClawInstallLaunchResult, String> {
     tauri::async_runtime::spawn_blocking(install_openclaw_inner)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn uninstall_openclaw() -> Result<OpenClawUninstallResult, String> {
+    tauri::async_runtime::spawn_blocking(uninstall_openclaw_inner)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn update_openclaw() -> Result<OpenClawUpdateResult, String> {
+    tauri::async_runtime::spawn_blocking(update_openclaw_inner)
         .await
         .map_err(|error| error.to_string())?
 }
@@ -163,12 +229,20 @@ async fn launch_openclaw_skill_install(
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
+            minimize_main_window,
+            toggle_main_window_maximize,
+            close_main_window,
+            is_main_window_maximized,
+            start_drag_main_window,
             scan_environment,
             install_dependency,
             switch_mirror_mode,
             fetch_openclaw_catalog,
             fetch_openclaw_runtime_overview,
+            fetch_openclaw_latest_version,
             install_openclaw,
+            uninstall_openclaw,
+            update_openclaw,
             register_openclaw_scan_dir,
             open_external_url,
             launch_openclaw_auth,
